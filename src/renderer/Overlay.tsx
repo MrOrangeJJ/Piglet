@@ -110,24 +110,53 @@ const Overlay = () => {
               let color = 'red';
               if (m.type.includes('right')) color = 'blue';
               if (m.type.includes('middle')) color = 'green';
+              const label =
+                m.type === 'double_click' ? 'left double click' :
+                m.type === 'right_click' ? 'right click' :
+                m.type === 'middle_click' ? 'middle click' :
+                'click';
               
               return (
-                <div 
-                    key={m.id}
-                    className="click-marker"
-                    style={{ 
-                        position: 'absolute', 
-                        left: (m.x || 0) - 20, 
-                        top: (m.y || 0) - 20,
-                        width: 40, 
-                        height: 40, 
-                        borderRadius: '50%', 
-                        border: `3px solid ${color}`,
-                        backgroundColor: `rgba(${color === 'red' ? '255,0,0' : color === 'blue' ? '0,0,255' : '0,255,0'}, 0.2)`,
-                        boxShadow: '0 0 10px rgba(0,0,0,0.5)',
-                        animation: 'ping 1s cubic-bezier(0, 0, 0.2, 1) infinite'
-                    }} 
-                />
+                <React.Fragment key={m.id}>
+                  <div 
+                      className="click-marker"
+                      style={{ 
+                          position: 'absolute', 
+                          left: (m.x || 0) - 24, 
+                          top: (m.y || 0) - 24,
+                          width: 48, 
+                          height: 48, 
+                          borderRadius: '50%', 
+                          border: `5px solid ${color === 'red' ? '#ff2a2a' : color}`,
+                          backgroundColor: `rgba(${color === 'red' ? '255,42,42' : color === 'blue' ? '0,0,255' : '0,255,0'}, 0.18)`,
+                          boxShadow: '0 0 14px rgba(0,0,0,0.55)',
+                          animation: 'ping 1s cubic-bezier(0, 0, 0.2, 1) infinite',
+                          zIndex: 9999,
+                      }} 
+                  />
+                  <div
+                    style={{
+                      position: 'absolute',
+                      left: (m.x || 0) + 18,
+                      top: (m.y || 0) - 44,
+                      backgroundColor: 'rgba(0,0,0,0.82)',
+                      color: 'white',
+                      padding: '6px 10px',
+                      borderRadius: '10px',
+                      fontSize: '13px',
+                      fontWeight: 600,
+                      zIndex: 10000,
+                      maxWidth: 240,
+                      whiteSpace: 'nowrap',
+                      overflow: 'hidden',
+                      textOverflow: 'ellipsis',
+                      backdropFilter: 'blur(4px)',
+                      border: '1px solid rgba(255,255,255,0.18)',
+                    }}
+                  >
+                    {label}
+                  </div>
+                </React.Fragment>
               );
           } else if (m.type === 'drag') {
                return (

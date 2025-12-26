@@ -83,6 +83,27 @@ export class DualAgentService {
   private lastActionResponse: string = '';
   private repeatActionCount: number = 0;
 
+  // Overlay annotation to be drawn into NEXT screenshot sent to LLM
+  private pendingScreenshotOverlay:
+    | {
+        kind:
+          | 'click'
+          | 'double_click'
+          | 'right_click'
+          | 'middle_click'
+          | 'drag'
+          | 'hover'
+          | 'hotkey';
+        x?: number; // logical screen coords
+        y?: number;
+        startX?: number;
+        startY?: number;
+        endX?: number;
+        endY?: number;
+        label: string;
+      }
+    | null = null;
+
   constructor(mainWindow: BrowserWindow, overlayWindow: BrowserWindow) {
     this.mainWindow = mainWindow;
     this.overlayWindow = overlayWindow;
@@ -287,6 +308,18 @@ export class DualAgentService {
     
     const scaleFactor = jimpImage.bitmap.width / screenSize.width;
     const MAX_PIXELS = 2116800;
+
+    // Draw previous step overlay into current screenshot for LLM (UI-TARS-like)
+    if (this.pendingScreenshotOverlay) {
+        try {
+            await this.drawOverlayIntoScreenshot(jimpImage, this.pendingScreenshotOverlay, scaleFactor);
+        } catch (e) {
+            console.warn('[captureScreen] drawOverlayIntoScreenshot failed', e);
+        } finally {
+            // Apply only once: "previous action" overlay
+            this.pendingScreenshotOverlay = null;
+        }
+    }
     
     let newWidth = jimpImage.bitmap.width;
     let newHeight = jimpImage.bitmap.height;
@@ -306,6 +339,94 @@ export class DualAgentService {
         height: newHeight, 
         scaleFactor
     };
+  }
+
+  private async drawOverlayIntoScreenshot(
+    image: any,
+    overlay: NonNullable<DualAgentService['pendingScreenshotOverlay']>,
+    scaleFactor: number,
+  ) {
+    const clamp = (n: number, min: number, max: number) => Math.max(min, Math.min(max, n));
+    const toPx = (v: number | undefined) =>
+      v == null ? undefined : Math.round(v * scaleFactor);
+
+    const W = image.bitmap.width;
+    const H = image.bitmap.height;
+
+    const font = await jimp.loadFont(jimp.FONT_SANS_16_WHITE);
+    const labelText = overlay.label || '';
+
+    const drawLabel = async (px: number, py: number, text: string) => {
+      const maxTextWidth = 260;
+      const textW = jimp.measureText(font, text);
+      const boxW = clamp(textW + 16, 60, maxTextWidth + 16);
+      const boxH = 28;
+      const bg = await new jimp(boxW, boxH, 0x000000aa);
+      bg.print(
+        font,
+        8,
+        6,
+        {
+          text,
+          alignmentX: jimp.HORIZONTAL_ALIGN_LEFT,
+          alignmentY: jimp.VERTICAL_ALIGN_MIDDLE,
+        },
+        boxW - 16,
+        boxH - 12,
+      );
+      // place near the marker, avoid going offscreen
+      const x = clamp(px + 18, 0, W - boxW - 2);
+      const y = clamp(py - boxH - 18, 0, H - boxH - 2);
+      image.composite(bg, x, y);
+    };
+
+    const drawRing = (px: number, py: number, radius: number, thickness: number) => {
+      const r2 = radius * radius;
+      const inner = radius - thickness;
+      const inner2 = inner * inner;
+      const minX = clamp(px - radius - 2, 0, W - 1);
+      const maxX = clamp(px + radius + 2, 0, W - 1);
+      const minY = clamp(py - radius - 2, 0, H - 1);
+      const maxY = clamp(py + radius + 2, 0, H - 1);
+      for (let y = minY; y <= maxY; y++) {
+        for (let x = minX; x <= maxX; x++) {
+          const dx = x - px;
+          const dy = y - py;
+          const d2 = dx * dx + dy * dy;
+          if (d2 <= r2 && d2 >= inner2) {
+            image.setPixelColor(0xff2a2aff, x, y); // bright red ring
+          } else if (d2 < inner2) {
+            // subtle fill to improve visibility
+            // only fill close to center a bit (keep light)
+            if (d2 < (inner2 * 0.25)) {
+              image.setPixelColor(0xff2a2a33, x, y);
+            }
+          }
+        }
+      }
+    };
+
+    if (overlay.kind === 'hotkey') {
+      // Place a bottom-center banner
+      const text = `hotkey: ${labelText}`;
+      const textW = jimp.measureText(font, text);
+      const boxW = clamp(textW + 24, 140, 420);
+      const boxH = 34;
+      const bg = await new jimp(boxW, boxH, 0x000000aa);
+      bg.print(font, 12, 9, text);
+      const x = Math.round((W - boxW) / 2);
+      const y = clamp(H - boxH - 36, 0, H - boxH - 2);
+      image.composite(bg, x, y);
+      return;
+    }
+
+    const px = toPx(overlay.x);
+    const py = toPx(overlay.y);
+    if (px == null || py == null) return;
+
+    // Bigger and clearer than current on-screen overlay: radius 28, thickness 6
+    drawRing(px, py, 28, 6);
+    await drawLabel(px, py, labelText);
   }
   private constructThoughtPrompt(instruction: string, extraPrompt?: string) {
     return `You are a GUI agent. You are given a task and action history, with screenshots of user's current screen. You need to perform the next action to complete the task. 
@@ -508,6 +629,8 @@ ${thought}`;
                 await sleep(100, signal); 
                 if (signal.aborted) return;
                 robot.mouseClick();
+                // annotate next screenshot
+                this.pendingScreenshotOverlay = { kind: 'click', x, y, label: 'click' };
             }
             break;
             
@@ -519,7 +642,20 @@ ${thought}`;
                 this.sendToOverlay('draw-highlight', { type: 'double_click', x, y });
                 await sleep(100, signal);
                 if (signal.aborted) return;
+                robot.mouseClick('left');
+                await sleep(10, signal); // within system double-click threshold
+                if (signal.aborted) return;
                 robot.mouseClick('left', true); 
+                // robot.mouseClick('left');
+                // await sleep(10, signal); // within system double-click threshold
+                // if (signal.aborted) return;
+                // robot.mouseClick('left');
+                this.pendingScreenshotOverlay = {
+                  kind: 'double_click',
+                  x,
+                  y,
+                  label: 'left double click',
+                };
             }
             break;
 
@@ -532,6 +668,7 @@ ${thought}`;
                 await sleep(100, signal);
                 if (signal.aborted) return;
                 robot.mouseClick('right');
+                this.pendingScreenshotOverlay = { kind: 'right_click', x, y, label: 'right click' };
             }
             break;
 
@@ -541,6 +678,7 @@ ${thought}`;
                 robot.moveMouse(x, y);
                 this.sendToOverlay('draw-highlight', { type: 'middle_click', x, y });
                 robot.mouseClick('middle'); 
+                this.pendingScreenshotOverlay = { kind: 'middle_click', x, y, label: 'middle click' };
             }
             break;
 
@@ -620,6 +758,7 @@ ${thought}`;
                     console.log(`Hotkey: ${mainKey} + [${modifiers}]`);
                     this.sendToOverlay('draw-highlight', { type: 'hotkey', text: args.key });
                     robot.keyTap(mainKey, modifiers);
+                    this.pendingScreenshotOverlay = { kind: 'hotkey', label: args.key };
                 }
             }
             break;
