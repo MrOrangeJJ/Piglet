@@ -11,6 +11,8 @@ export interface RulePrompt {
     name: string;
     content: string;
     enabled: boolean;
+    injectToAdvanced: boolean;
+    injectToAction: boolean;
 }
 
 export interface AppConfig {

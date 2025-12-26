@@ -12,6 +12,8 @@ export interface RulePrompt {
     name: string;
     content: string;
     enabled: boolean;
+    injectToAdvanced: boolean;
+    injectToAction: boolean;
 }
 
 export interface AppSettings {
@@ -41,7 +43,17 @@ export const useSettings = () => {
         // Load settings from main process
         ipcRenderer.invoke('get-settings').then((savedSettings) => {
             if (savedSettings) {
-                setSettings({ ...DEFAULT_SETTINGS, ...savedSettings });
+                const merged = { ...DEFAULT_SETTINGS, ...savedSettings } as AppSettings;
+                // Normalize legacy rules (backward compatibility)
+                merged.rules = (merged.rules || []).map((r: any) => ({
+                    id: r.id,
+                    name: r.name ?? 'Rule',
+                    content: r.content ?? '',
+                    enabled: !!r.enabled,
+                    injectToAdvanced: r.injectToAdvanced ?? true,
+                    injectToAction: r.injectToAction ?? false,
+                }));
+                setSettings(merged);
             }
         }).catch(err => console.error("Failed to load settings:", err));
     }, []);

@@ -19,6 +19,8 @@ export interface AppConfig {
         name: string;
         content: string;
         enabled: boolean;
+        injectToAdvanced?: boolean;
+        injectToAction?: boolean;
     }>;
 }
 
@@ -209,8 +211,12 @@ export class DualAgentService {
   private async runLoop(instruction: string, signal: AbortSignal) {
     let currentInstruction = instruction;
     let count = 0;
-    const extraPrompt = (this.currentConfig?.rules || [])
-        .filter((r) => r && r.enabled && (r.content || '').trim().length > 0)
+    const advancedExtraPrompt = (this.currentConfig?.rules || [])
+        .filter((r) => r && r.enabled && (r.content || '').trim().length > 0 && (r.injectToAdvanced ?? true))
+        .map((r) => r.content.trim())
+        .join('\n\n');
+    const actionExtraPrompt = (this.currentConfig?.rules || [])
+        .filter((r) => r && r.enabled && (r.content || '').trim().length > 0 && (r.injectToAction ?? false))
         .map((r) => r.content.trim())
         .join('\n\n');
     
@@ -219,11 +225,11 @@ export class DualAgentService {
       
       let thoughtPrompt = "";
       if (count <= 0){
-        thoughtPrompt = this.constructThoughtPrompt(currentInstruction, extraPrompt);
+        thoughtPrompt = this.constructThoughtPrompt(currentInstruction, advancedExtraPrompt);
       } else {
         thoughtPrompt = "这是user执行过上一次操作后的屏幕截图，请你继续指示下一步操作(注意根据当前截图判断用户上一部是否正确的执行了要求的操作！如果没有请你继续换一种请你换一种指式方法/想想其他办法/更详细的描述来操作上一步。)";
-        if (extraPrompt) {
-          thoughtPrompt += `\n\n# ## Extra Prompt\n${extraPrompt}`;
+        if (advancedExtraPrompt) {
+          thoughtPrompt += `\n\n# ## Extra Prompt\n${advancedExtraPrompt}`;
         }
       }
 
@@ -240,26 +246,30 @@ export class DualAgentService {
     const imageSrc = `data:image/png;base64,${base64}`;
     this.sendToMain('agent-thought', { text: thoughtResponse, image: imageSrc });
       
-      const actionPrompt = this.constructActionPrompt(thoughtResponse); 
+      const actionPrompt = this.constructActionPrompt(thoughtResponse, actionExtraPrompt); 
       if (signal.aborted) break;
 
     const actionResponse = await this.callActionModel(base64, actionPrompt);
     if (signal.aborted) break;
 
+
     this.sendToMain('agent-action-plan', { text: actionResponse, image: imageSrc });
 
+    //提取actionResponse中Action:开始的内容(包括Action:)
+    const actionText = actionResponse.match(/Action:\s*(.*)/)?.[1] || "";
+    
       // Track Repetition
-      if (actionResponse === this.lastActionResponse) {
+      if (actionText === this.lastActionResponse) {
           this.repeatActionCount++;
       } else {
           this.repeatActionCount = 1;
-          this.lastActionResponse = actionResponse;
+          this.lastActionResponse = actionText;
       }
 
       count++;
-      await this.executeAction(actionResponse, width, height, scaleFactor, signal);
+      await this.executeAction(actionText, width, height, scaleFactor, signal);
       
-      if (actionResponse.includes("finished")) {
+      if (actionText.includes("finished")) {
         this.sendToMain('task-finished');
         break;
       }
@@ -328,8 +338,8 @@ ${extraPrompt}
 ${instruction}`;
   }
 
-  private constructActionPrompt(thought: string) {
-    return `You are a GUI agent. You are given a action instruction and action history, with screenshots. You need to perform the next action(follow the instruction strictly dont think too much, do what the instruction ask you to do) to complete the task. 
+  private constructActionPrompt(thought: string, extraPrompt?: string) {
+    return `You are a GUI agent. You are given a action instruction, with screenshots. You need to perform the next action(follow the instruction strictly dont think too much, do what the instruction ask you to do) to complete the task. 
 
 ## Output Format
 \`\`\`
@@ -352,7 +362,11 @@ finished(content='xxx') # Use escape characters \\', \\", and \\n in content par
 # - Make SURE Only One Action At A Time!
 # - Even if the instructions contain two consecutive actions, you can only output one action at a time.
 # - For example, 'type(content='xxx') \nhotkey(key='enter')' is not allowed in one output, you should only output 'type(content='xxx')'instead.
+# - You must 100% follow the instruction strictly, if instructions tell you to press whichever keyboard shortcut you must do 100% the same.
 
+
+## Extra Prompt
+${extraPrompt}
 ## User Instruction
 ${thought}`;
   }
@@ -397,16 +411,30 @@ ${thought}`;
         }
     ];
     
-    const completion = await this.actionClient.chat.completions.create({
-        model: this.currentConfig.actionModel.modelName,
-        messages: messages as any,
-        temperature: 0
-    });
+    const maxAttempts = 2;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        const completion = await this.actionClient.chat.completions.create({
+            model: this.currentConfig.actionModel.modelName,
+            messages: messages as any,
+            temperature: 0
+        });
+        
+        const content = completion.choices[0].message.content || "";
+        const hasAction = content.includes("Action:");
+        
+        if (hasAction) {
+            // Only record valid outputs to avoid polluting history
+            this.actionHistory.push({ role: "user", content: prompt });
+            this.actionHistory.push({ role: "assistant", content });
+            return content;
+        }
+        
+        console.warn(`[ActionModel] Missing "Action:" in response (attempt ${attempt}/${maxAttempts}). Retrying once...`, content);
+        // Do NOT record invalid output; retry once.
+    }
     
-    const content = completion.choices[0].message.content || "";
-    this.actionHistory.push({ role: "user", content: prompt });
-    this.actionHistory.push({ role: "assistant", content });
-    return content;
+    // If still invalid after retry, return last content without recording
+    return "";
   }
 
   private parseAction(actionStr: string) {

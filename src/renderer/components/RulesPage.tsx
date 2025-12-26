@@ -1,5 +1,5 @@
 import React, { useMemo, useState } from 'react';
-import { Check, Pencil, Plus, Trash2, X } from 'lucide-react';
+import { Brain, Check, Pencil, Plus, Trash2, X, Zap } from 'lucide-react';
 import type { AppSettings, RulePrompt } from '../hooks/useSettings';
 
 interface RulesPageProps {
@@ -12,6 +12,8 @@ const newRule = (): RulePrompt => ({
   name: 'New Rule',
   content: '',
   enabled: true,
+  injectToAdvanced: true,
+  injectToAction: false,
 });
 
 export const RulesPage = ({ settings, onSave }: RulesPageProps) => {
@@ -122,6 +124,42 @@ export const RulesPage = ({ settings, onSave }: RulesPageProps) => {
                         )}
                       </div>
                     )}
+                  </div>
+
+                  {/* Inject toggles */}
+                  <div className="flex items-center gap-1 rounded-md border border-border bg-muted/30 p-1">
+                    <button
+                      type="button"
+                      onClick={() =>
+                        updateRule(rule.id, { injectToAdvanced: !rule.injectToAdvanced })
+                      }
+                      className={[
+                        'h-8 w-8 rounded-md flex items-center justify-center transition-colors',
+                        rule.injectToAdvanced
+                          ? 'bg-background text-blue-600 shadow-sm'
+                          : 'text-muted-foreground hover:bg-background/60',
+                      ].join(' ')}
+                      title="Inject to Advanced (Brain)"
+                      aria-label="Inject to Advanced"
+                    >
+                      <Brain size={16} />
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        updateRule(rule.id, { injectToAction: !rule.injectToAction })
+                      }
+                      className={[
+                        'h-8 w-8 rounded-md flex items-center justify-center transition-colors',
+                        rule.injectToAction
+                          ? 'bg-background text-amber-600 shadow-sm'
+                          : 'text-muted-foreground hover:bg-background/60',
+                      ].join(' ')}
+                      title="Inject to Action (Hands)"
+                      aria-label="Inject to Action"
+                    >
+                      <Zap size={16} />
+                    </button>
                   </div>
 
                   {/* Actions */}
