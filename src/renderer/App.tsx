@@ -10,12 +10,27 @@ import './index.css';
 
 const App = () => {
     const [activeTab, setActiveTab] = useState<'chat' | 'settings' | 'rules'>('chat');
-    const { settings, updateSettings } = useSettings();
+    const { settings, updateSettings, refreshSettings } = useSettings();
     
   const [instruction, setInstruction] = useState('');
     const [logs, setLogs] = useState<LogItem[]>([]);
-    const [latestImage, setLatestImage] = useState<string | undefined>(undefined);
+    // Screenshot history is kept for a single task; cleared on next start.
+    const [taskImages, setTaskImages] = useState<string[]>([]);
+    const [activeImageIndex, setActiveImageIndex] = useState<number>(-1);
   const [isRunning, setIsRunning] = useState(false);
+  const [hasFinished, setHasFinished] = useState(false);
+
+  const pushTaskImage = (image?: string) => {
+    if (!image) return;
+    setTaskImages((prev) => {
+      // De-dupe adjacent duplicates (agent-thought / agent-action-plan often share the same image)
+      if (prev.length && prev[prev.length - 1] === image) return prev;
+      const next = [...prev, image];
+      // Default behavior: always display the latest screenshot as it arrives.
+      setActiveImageIndex(next.length - 1);
+      return next;
+    });
+  };
 
   useEffect(() => {
     ipcRenderer.on('agent-thought', (_, payload: { text: string, image: string }) => {
@@ -25,7 +40,7 @@ const App = () => {
                 timestamp: Date.now(), 
                 type: 'thought' 
             }]);
-            setLatestImage(payload.image);
+            pushTaskImage(payload.image);
     });
     
     ipcRenderer.on('agent-action-plan', (_, payload: { text: string, image: string }) => {
@@ -35,12 +50,13 @@ const App = () => {
                 timestamp: Date.now(), 
                 type: 'action' 
             }]);
-            // Action plan usually shares the same image context or new one
-            if (payload.image) setLatestImage(payload.image);
+            // Keep all screenshots for this task.
+            pushTaskImage(payload.image);
     });
 
     ipcRenderer.on('task-finished', () => {
         setIsRunning(false);
+        setHasFinished(true);
             setLogs(prev => [...prev, {
                 text: "Task Finished",
                 timestamp: Date.now(),
@@ -50,6 +66,7 @@ const App = () => {
         
         ipcRenderer.on('task-error', (_, error: any) => {
             setIsRunning(false);
+            setHasFinished(true);
             setLogs(prev => [...prev, {
                 text: `Error: ${typeof error === 'string' ? error : JSON.stringify(error)}`,
                 timestamp: Date.now(),
@@ -65,14 +82,25 @@ const App = () => {
     };
   }, []);
 
+  // When user enters Rules tab, refresh settings so external edits to rules.json are reflected.
+  useEffect(() => {
+    if (activeTab === 'rules') {
+      refreshSettings().catch((e: any) => console.error('Failed to refresh settings', e));
+    }
+  }, [activeTab, refreshSettings]);
+
   const handleStart = () => {
         if (!instruction.trim()) return;
     setIsRunning(true);
+        setHasFinished(false);
         setLogs([{
             text: `Task Started: ${instruction}`,
             timestamp: Date.now(),
             type: 'system'
         }]);
+        // Clear screenshot history for new task
+        setTaskImages([]);
+        setActiveImageIndex(-1);
         
         // Pass settings to backend
         ipcRenderer.send('start-task', { 
@@ -84,6 +112,7 @@ const App = () => {
   const handleStop = () => {
         // Optimistic update
     setIsRunning(false);
+        setHasFinished(true);
     ipcRenderer.send('stop-task');
         setLogs(prev => [...prev, {
             text: "Stopping task...",
@@ -99,15 +128,25 @@ const App = () => {
             <div className="flex-1 flex overflow-hidden">
                 {activeTab === 'chat' ? (
                     <>
-                        <ChatInterface 
-                            logs={logs}
-                            instruction={instruction}
-                            setInstruction={setInstruction}
-                            isRunning={isRunning}
-                            onStart={handleStart}
-                            onStop={handleStop}
-                        />
-                        <ContextPanel latestImage={latestImage} />
+                        {/* Chat should flex; Context View should take ~60% */}
+                        <div className="flex-1 min-w-0">
+                            <ChatInterface 
+                                logs={logs}
+                                instruction={instruction}
+                                setInstruction={setInstruction}
+                                isRunning={isRunning}
+                                onStart={handleStart}
+                                onStop={handleStop}
+                            />
+                        </div>
+                        <div className="basis-[60%] shrink-0 min-w-0">
+                            <ContextPanel
+                                images={taskImages}
+                                activeIndex={activeImageIndex}
+                                onChangeIndex={setActiveImageIndex}
+                                showNavigator={hasFinished && taskImages.length > 1}
+                            />
+                        </div>
                     </>
                 ) : activeTab === 'settings' ? (
                     <SettingsPage settings={settings} onSave={updateSettings} />

@@ -24,7 +24,17 @@ export default defineConfig({
             build: {
                 outDir: 'dist-electron',
                 rollupOptions: {
-                    external: ['robotjs', 'screenshot-desktop', 'jimp', 'openai']
+                    external: [
+                      'robotjs',
+                      'screenshot-desktop',
+                      'jimp',
+                      'openai',
+                      'langchain',
+                      '@langchain/openai',
+                      '@langchain/langgraph',
+                      '@langchain/core',
+                      'zod',
+                    ]
                 }
             }
         }

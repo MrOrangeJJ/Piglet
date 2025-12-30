@@ -92,7 +92,7 @@ export const ChatInterface = ({
                             onChange={(e) => setInstruction(e.target.value)}
                             onKeyDown={handleKeyDown}
                             disabled={isRunning}
-                            placeholder="Type your instruction here (e.g. 'Open Calendar and add a meeting')..."
+                            placeholder=""
                             className="w-full min-h-[50px] max-h-[200px] p-3 pr-12 rounded-xl border border-input bg-background ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50 resize-none shadow-sm"
                             rows={1}
                             style={{ height: 'auto', minHeight: '52px' }}

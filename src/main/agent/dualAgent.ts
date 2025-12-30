@@ -1,77 +1,106 @@
-import { BrowserWindow, ipcMain, IpcMain, clipboard } from 'electron';
-import { OpenAI } from 'openai';
-import robot from 'robotjs';
-import screenshot from 'screenshot-desktop';
-import jimp from 'jimp';
-
-// Types for IPC messages
-export interface ModelConfig {
-    baseUrl: string;
-    apiKey: string;
-    modelName: string;
-}
-
-export interface AppConfig {
-    advancedModel: ModelConfig;
-    actionModel: ModelConfig;
-    rules?: Array<{
-        id: string;
-        name: string;
-        content: string;
-        enabled: boolean;
-        injectToAdvanced?: boolean;
-        injectToAction?: boolean;
-    }>;
-}
+import { BrowserWindow } from 'electron';
+import { ChatOpenAI, OpenAIEmbeddings } from '@langchain/openai';
+import { SemanticSimilarityExampleSelector } from '@langchain/core/example_selectors';
+import { MemoryVectorStore } from '@langchain/classic/vectorstores/memory';
+import { HumanMessage, SystemMessage, type BaseMessage, AIMessage } from '@langchain/core/messages';
+import { Annotation, StateGraph, START, END } from '@langchain/langgraph';
+import { tool } from 'langchain';
+import * as z from 'zod';
+import {
+  buildActionPrompt,
+  buildAdvancedFollowupPrompt,
+  buildAdvancedSystemPrompt,
+  buildExecutorSystemPrompt,
+} from './promptTemplate';
+import {
+  captureScreenB64,
+  executeUiTarsAction,
+  escapeSingleQuotes,
+  getExecutorToolSchemaText,
+  selfTestMouseMovement,
+  sleep,
+  type PendingScreenshotOverlay,
+} from './utils';
+import type { AppConfig } from '../store';
 
 export interface TaskStartPayload {
   instruction: string;
   config: AppConfig;
 }
 
-const sleep = (ms: number, signal?: AbortSignal) => new Promise((resolve, reject) => {
-    const timeout = setTimeout(() => resolve(true), ms);
-    if (signal) {
-        if (signal.aborted) {
-            clearTimeout(timeout);
-            reject(new Error('Aborted'));
-            return;
-        }
-        signal.addEventListener('abort', () => {
-            clearTimeout(timeout);
-            reject(new Error('Aborted'));
-        });
-    }
+// NOTE: helpers (sleep/mapKey/escapeSingleQuotes/screenshot/action exec) moved to ./utils
+
+const ACTION_TYPES = [
+  "click",
+  "left_double",
+  "right_single",
+  "drag",
+  "hotkey",
+  "type",
+  "scroll",
+  "wait",
+  "finished",
+] as const;
+
+const ThoughtResponseSchema = z.object({
+  // 对齐 tutorial.py 的 Pydantic Field(description=...)
+  Thought: z.string().describe("what have you see in the screenshot and based on that, your thought on what should you do next to complete the task/why"),
+  Instruction: z.string().describe("clear instruction to the user, in chinese"),
+  // View: z.string(),
+  ActionType: z
+    .enum(ACTION_TYPES)
+    .describe(
+      "left_double is double click, right_single is right click! Make sure dont use click when you need to double click(some very common action like open file need to use double click)",
+    ),
 });
 
-const mapKey = (key: string): string => {
-    const map: Record<string, string> = {
-        'return': 'enter',
-        'ctrl': 'control',
-        'cmd': 'command',
-        'win': 'command',
-        'meta': 'command',
-        'shift': 'shift',
-        'alt': 'alt',
-        'esc': 'escape',
-        'space': 'space',
-        'up': 'up',
-        'down': 'down',
-        'left': 'left',
-        'right': 'right',
-        'page down': 'pagedown',
-        'page up': 'pageup',
-    };
-    return map[key.toLowerCase()] || key.toLowerCase();
+type ThoughtResponse = z.infer<typeof ThoughtResponseSchema>;
+
+// LangGraph TS 的 Annotation 类型在复杂工程里容易触发 TS 推导/缓存问题。
+// 这里把 Annotation 相关类型降级为 any，避免阻塞开发；运行时逻辑不受影响。
+const Ann: any = Annotation;
+const PigletState = Ann.Root({
+  userQuery: Ann({ default: () => "" }),
+  step: Ann({ default: () => 0 }),
+  advancedHistory: Ann({ default: () => [] }),
+
+  screenshotB64: Ann({ default: () => undefined }),
+  // Action 模型专用：不带 overlay 注入的截图
+  rawScreenshotB64: Ann({ default: () => undefined }),
+  modelW: Ann({ default: () => undefined }),
+  modelH: Ann({ default: () => undefined }),
+  scaleFactor: Ann({ default: () => undefined }),
+
+  thoughtResponse: Ann({ default: () => undefined }),
+  instructionForUser: Ann({ default: () => undefined }),
+  actionType: Ann({ default: () => undefined }),
+
+  actionPrompt: Ann({ default: () => undefined }),
+  actionResponseText: Ann({ default: () => undefined }),
+  actionLine: Ann({ default: () => undefined }),
+
+  finalInstructionForExecutor: Ann({ default: () => undefined }),
+  finished: Ann({ default: () => undefined }),
+});
+
+type PigletStateType = any;
+
+type AdvancedRuleExample = {
+  input: string;
+  content: string;
+  rule_name: string;
+  id: string;
 };
 
 export class DualAgentService {
-  private advancedClient: OpenAI | null = null;
-  private actionClient: OpenAI | null = null;
-  private advancedHistory: any[] = [];
-  private actionHistory: any[] = [];
+  private advancedModel: ChatOpenAI | null = null;
+  private actionModel: ChatOpenAI | null = null;
+  private executorModel: ChatOpenAI | null = null;
+  private advancedHistory: BaseMessage[] = [];
   private mainWindow: BrowserWindow;
   private overlayWindow: BrowserWindow;
+  // LangChain 原生机制：语意相似规则选择器（只用于 Advanced rules 动态注入）
+  private advancedRuleSelector: SemanticSimilarityExampleSelector<any> | null = null;
   
   // Abort Controller for immediate stopping
   private abortController: AbortController | null = null;
@@ -84,29 +113,112 @@ export class DualAgentService {
   private repeatActionCount: number = 0;
 
   // Overlay annotation to be drawn into NEXT screenshot sent to LLM
-  private pendingScreenshotOverlay:
-    | {
-        kind:
-          | 'click'
-          | 'double_click'
-          | 'right_click'
-          | 'middle_click'
-          | 'drag'
-          | 'hover'
-          | 'hotkey';
-        x?: number; // logical screen coords
-        y?: number;
-        startX?: number;
-        startY?: number;
-        endX?: number;
-        endY?: number;
-        label: string;
-      }
-    | null = null;
+  private pendingScreenshotOverlay: PendingScreenshotOverlay = null;
+
+  // Main window UI state before a task starts (so we can restore after task ends)
+  private mainWindowStateBeforeTask: null | {
+    wasMinimized: boolean;
+    wasMaximized: boolean;
+    wasFullScreen: boolean;
+    wasVisible: boolean;
+  } = null;
 
   constructor(mainWindow: BrowserWindow, overlayWindow: BrowserWindow) {
     this.mainWindow = mainWindow;
     this.overlayWindow = overlayWindow;
+  }
+
+  private minimizeMainWindowForTask() {
+    if (!this.mainWindow || this.mainWindow.isDestroyed()) return;
+    if (this.mainWindowStateBeforeTask) return; // already captured for this task
+
+    const state = {
+      wasMinimized: this.mainWindow.isMinimized(),
+      wasMaximized: this.mainWindow.isMaximized(),
+      wasFullScreen: this.mainWindow.isFullScreen(),
+      wasVisible: this.mainWindow.isVisible(),
+    };
+    this.mainWindowStateBeforeTask = state;
+
+    try {
+      // Avoid trapping the user in fullscreen during automation; minimize will send to Dock.
+      if (state.wasFullScreen) this.mainWindow.setFullScreen(false);
+    } catch (e) {
+      console.warn('[minimizeMainWindowForTask] setFullScreen(false) failed', e);
+    }
+
+    const tryMinimize = (tag: string) => {
+      try {
+        if (this.mainWindow.isDestroyed()) return;
+        if (!state.wasMinimized && !this.mainWindow.isMinimized()) {
+          this.mainWindow.minimize();
+        }
+        if (!state.wasMinimized && !this.mainWindow.isMinimized()) {
+          // Some macOS window types/state transitions can ignore the first minimize call.
+          console.warn('[minimizeMainWindowForTask] minimize did not take effect', {
+            tag,
+            wasVisible: state.wasVisible,
+            wasMaximized: state.wasMaximized,
+            wasFullScreen: state.wasFullScreen,
+          });
+        }
+      } catch (e) {
+        console.warn('[minimizeMainWindowForTask] minimize failed', { tag, e });
+      }
+    };
+
+    // Try immediately, then retry a couple times to avoid races with window focus/showInactive.
+    tryMinimize('now');
+    setTimeout(() => tryMinimize('t+50ms'), 50);
+    setTimeout(() => tryMinimize('t+200ms'), 200);
+  }
+
+  private restoreMainWindowAfterTask() {
+    if (!this.mainWindow || this.mainWindow.isDestroyed()) {
+      this.mainWindowStateBeforeTask = null;
+      return;
+    }
+    const state = this.mainWindowStateBeforeTask;
+    this.mainWindowStateBeforeTask = null;
+    if (!state) return;
+
+    try {
+      // Only undo minimize if we minimized it.
+      if (!state.wasMinimized && this.mainWindow.isMinimized()) {
+        this.mainWindow.restore();
+      }
+    } catch {
+      // ignore
+    }
+
+    try {
+      // If the user had it visible, bring it back. If user had it minimized, don't steal focus.
+      if (!state.wasMinimized) {
+        this.mainWindow.show();
+        this.mainWindow.focus();
+      } else if (state.wasVisible) {
+        // keep it visible state without stealing focus too aggressively
+        this.mainWindow.showInactive();
+      }
+    } catch {
+      // ignore
+    }
+
+    try {
+      if (state.wasMaximized && !this.mainWindow.isMaximized()) {
+        this.mainWindow.maximize();
+      }
+    } catch {
+      // ignore
+    }
+
+    try {
+      if (state.wasFullScreen && !this.mainWindow.isFullScreen()) {
+        this.mainWindow.setFullScreen(true);
+      }
+    } catch {
+      // ignore
+    }
   }
 
   /** Ensure overlay is click-through (critical to avoid "mouse dead" after task ends) */
@@ -145,50 +257,82 @@ export class DualAgentService {
   async startTask(instruction: string, config: AppConfig) {
     // Cancel previous task if running
     if (this.abortController) {
-        this.abortController.abort();
+        // ensure UI state (overlay/widget/window) is cleaned up consistently
+        this.stopTask();
     }
     this.abortController = new AbortController();
     const signal = this.abortController.signal;
 
     this.currentConfig = config;
     this.advancedHistory = [];
-    this.actionHistory = [];
     this.lastActionResponse = '';
     this.repeatActionCount = 0;
     
-    // Initialize clients with new config
+    // Initialize LangChain models with new config
     try {
-        this.advancedClient = new OpenAI({
-            baseURL: config.advancedModel.baseUrl,
+        this.advancedModel = new ChatOpenAI({
+            model: config.advancedModel.modelName,
             apiKey: config.advancedModel.apiKey,
-            dangerouslyAllowBrowser: true
+            configuration: { baseURL: config.advancedModel.baseUrl },
+            temperature: 0,
         });
         
-        this.actionClient = new OpenAI({
-            baseURL: config.actionModel.baseUrl,
+        this.actionModel = new ChatOpenAI({
+            model: config.actionModel.modelName,
             apiKey: config.actionModel.apiKey,
-            dangerouslyAllowBrowser: true
+            configuration: { baseURL: config.actionModel.baseUrl },
+            temperature: 0,
         });
+
+        this.executorModel = new ChatOpenAI({
+            model: config.executorModel.modelName,
+            apiKey: config.executorModel.apiKey,
+            configuration: { baseURL: config.executorModel.baseUrl },
+            temperature: 0,
+        });
+
+        // Build advanced rules selector using LangChain's official mechanism:
+        // SemanticSimilarityExampleSelector.fromExamples(..., MemoryVectorStore, { k, inputKeys })
+        const candidates = (config.rules || [])
+          .filter((r: any) => r && (r.content || "").trim().length > 0)
+          .filter((r: any) => !!r.enabled && !(r.alwaysInject ?? false));
+
+        if (!candidates.length) {
+          this.advancedRuleSelector = null;
+        } else {
+          const embeddings = new OpenAIEmbeddings({
+            model: config.embeddingsModel.modelName,
+            apiKey: config.embeddingsModel.apiKey,
+            configuration: { baseURL: config.embeddingsModel.baseUrl },
+          });
+
+          const examples: AdvancedRuleExample[] = candidates.map((r: any) => ({
+            id: String(r.id ?? ""),
+            rule_name: String(r.name ?? "Rule"),
+            content: String((r.content || "").trim()),
+            input: String((r.content || "").trim()),
+          }));
+
+          try {
+            this.advancedRuleSelector = await SemanticSimilarityExampleSelector.fromExamples(
+              examples as any,
+              embeddings as any,
+              MemoryVectorStore as any,
+              { k: 2, inputKeys: ["input"] } as any,
+            );
+          } catch (e) {
+            console.warn("[advancedRuleSelector] init failed, skip dynamic rules injection.", e);
+            this.advancedRuleSelector = null;
+          }
+        }
     } catch (e) {
-        this.mainWindow.webContents.send('task-error', "Failed to initialize OpenAI clients. Check your settings.");
+        this.mainWindow.webContents.send('task-error', "Failed to initialize LangChain models. Check your settings.");
         return;
     }
     
     // --- Self-Test: Mouse Movement ---
     try {
-        console.log("Testing mouse movement...");
-        const screenSize = robot.getScreenSize();
-        const center = { x: screenSize.width / 2, y: screenSize.height / 2 };
-        
-        robot.moveMouse(center.x, center.y);
-        if (signal.aborted) return;
-        
-        // Using signal-aware sleep for smoother interruption
-        // But for short UI feedback actions, standard sleep is ok, but risky if user stops *during* init
-        robot.moveMouse(center.x + 50, center.y);
-        robot.moveMouse(center.x - 50, center.y);
-        robot.moveMouse(center.x, center.y);
-        console.log("Mouse test complete.");
+        selfTestMouseMovement(signal);
     } catch (e) {
         console.error("Mouse test failed! Check Accessibility Permissions.", e);
         this.mainWindow.webContents.send('task-error', "Mouse control failed. Please grant Accessibility permissions.");
@@ -200,6 +344,8 @@ export class DualAgentService {
     // Show overlay widget
     this.ensureOverlayClickThrough();
     this.sendToOverlay('show-widget', { visible: true });
+    // Minimize Piglet main window while task runs (do NOT affect overlay window)
+    this.minimizeMainWindowForTask();
 
     try {
       await this.runLoop(instruction, signal);
@@ -215,6 +361,8 @@ export class DualAgentService {
       // Always restore click-through even if the user was hovering the widget when it hides
       this.ensureOverlayClickThrough();
       this.sendToOverlay('show-widget', { visible: false });
+      // Restore Piglet main window after task ends
+      this.restoreMainWindowAfterTask();
     }
   }
 
@@ -227,567 +375,497 @@ export class DualAgentService {
     this.ensureOverlayClickThrough();
     this.sendToOverlay('show-widget', { visible: false });
     this.sendToMain('task-finished'); // Update UI immediately
+    // Restore Piglet main window if we minimized it
+    this.restoreMainWindowAfterTask();
   }
 
   private async runLoop(instruction: string, signal: AbortSignal) {
-    let currentInstruction = instruction;
-    let count = 0;
-    const advancedExtraPrompt = (this.currentConfig?.rules || [])
-        .filter((r) => r && r.enabled && (r.content || '').trim().length > 0 && (r.injectToAdvanced ?? true))
-        .map((r) => r.content.trim())
-        .join('\n\n');
-    const actionExtraPrompt = (this.currentConfig?.rules || [])
-        .filter((r) => r && r.enabled && (r.content || '').trim().length > 0 && (r.injectToAction ?? false))
-        .map((r) => r.content.trim())
-        .join('\n\n');
-    
-    while (!signal.aborted) {
-      const { base64, width, height, scaleFactor } = await this.captureScreen();
-      
-      let thoughtPrompt = "";
-      if (count <= 0){
-        thoughtPrompt = this.constructThoughtPrompt(currentInstruction, advancedExtraPrompt);
-      } else {
-        thoughtPrompt = "这是user执行过上一次操作后的屏幕截图，请你继续指示下一步操作(注意根据当前截图判断用户上一部是否正确的执行了要求的操作！如果没有请你继续换一种请你换一种指式方法/想想其他办法/更详细的描述来操作上一步。)";
-        if (advancedExtraPrompt) {
-          thoughtPrompt += `\n\n# ## Extra Prompt\n${advancedExtraPrompt}`;
+    if (!this.currentConfig) throw new Error("Config not initialized");
+    if (!this.advancedModel || !this.actionModel || !this.executorModel) {
+      throw new Error("LangChain models not initialized");
+    }
+
+    // NOTE: LangGraph 的 TS 类型在复杂项目里仍可能很重；这里保持节点签名宽松（state: any）
+    const graph = new StateGraph(PigletState)
+      .addNode("capture", async (state: PigletStateType) => {
+        if (signal.aborted) throw new Error("Aborted");
+        const { base64WithOverlay, base64Raw, width, height, scaleFactor, pendingOverlayAfter } =
+          await captureScreenB64({ pendingOverlay: this.pendingScreenshotOverlay });
+        this.pendingScreenshotOverlay = pendingOverlayAfter;
+        return {
+          screenshotB64: base64WithOverlay, // 给 Advanced / UI 展示用：带 overlay
+          rawScreenshotB64: base64Raw,      // 给 Action 用：不带 overlay
+          modelW: width,
+          modelH: height,
+          scaleFactor,
+        };
+      })
+      .addNode("build_thought_prompt", async (state: PigletStateType) => {
+        if (signal.aborted) throw new Error("Aborted");
+        const step = state.step || 0;
+        const screenshotB64 = state.screenshotB64 || "";
+        const queryForRules = step <= 0 ? state.userQuery : (state.thoughtResponse || "");
+        const advancedExtraPrompt = await this.selectAdvancedRulesPrompt(queryForRules);
+
+        // Rehydrate advanced history from state, then build new history for this turn
+        this.advancedHistory = (state.advancedHistory || []) as any;
+        const history = this.buildThoughtHistoryForThisTurn({
+          step,
+          screenshotBase64: screenshotB64,
+          userQuery: state.userQuery,
+          advancedExtraPrompt,
+        });
+
+        return { advancedHistory: history };
+      })
+      .addNode("call_advanced", async (state: PigletStateType) => {
+        if (signal.aborted) throw new Error("Aborted");
+        const history = (state.advancedHistory || []) as any as BaseMessage[];
+        const res = await this.callAdvancedStructured(history);
+
+        // tutorial.py: push AIMessage(content=Thought) into history
+        const updatedHistory = [...history, new AIMessage(res.Thought)];
+
+        // Fix: type action should NOT accidentally add trailing \\n (unless explicitly asked)
+        let instr = (res.Instruction || "").toString();
+        if (res.ActionType === "type") {
+          const explicitEnter = /回车|enter|提交|确认|搜索/i.test(instr);
+          if (!explicitEnter) instr = instr.replace(/(\\n|\n)+$/g, "");
         }
-      }
 
-      // Inject Warning if action repeated 3+ times
-      if (this.repeatActionCount >= 3) {
-          thoughtPrompt += "\n\n(注意：Action Model的输出已经连续3次完全一样了！请你换一种指式方法/想想其他办法/更详细的描述！这个user比较笨，听不懂你现在这个指令)";
-          console.log("Injecting repetition warning to Advanced Model.");
-      }
+        const imageSrc = `data:image/png;base64,${state.screenshotB64 || ""}`;
+        const thoughtDisplay =
+          `Thought: ${res.Thought}\n` + `Instruction: ${instr}\n` + `ActionType: ${res.ActionType}`;
+        this.sendToMain("agent-thought", { text: thoughtDisplay, image: imageSrc });
 
-    if (signal.aborted) break;
-    const thoughtResponse = await this.callAdvancedModel(base64, thoughtPrompt);
-    if (signal.aborted) break;
-    
-    const imageSrc = `data:image/png;base64,${base64}`;
-    this.sendToMain('agent-thought', { text: thoughtResponse, image: imageSrc });
-      
-      const actionPrompt = this.constructActionPrompt(thoughtResponse, actionExtraPrompt); 
-      if (signal.aborted) break;
+        return {
+          thoughtResponse: res.Thought,
+          instructionForUser: instr,
+          actionType: res.ActionType,
+          advancedHistory: updatedHistory,
+        };
+      })
+      .addNode("build_action_prompt", async (state: PigletStateType) => {
+        return { actionPrompt: buildActionPrompt({ thought: state.instructionForUser || "", extraPrompt: "" }) };
+      })
+      .addNode("call_action", async (state: PigletStateType) => {
+        if (signal.aborted) throw new Error("Aborted");
+        // Action 模型看到的截图：不带 overlay
+        const base64ForActionModel = state.rawScreenshotB64 || state.screenshotB64 || "";
+        const prompt = state.actionPrompt || "";
+        const text = await this.callActionV2(base64ForActionModel, prompt);
 
-    const actionResponse = await this.callActionModel(base64, actionPrompt);
-    if (signal.aborted) break;
-
-
-    this.sendToMain('agent-action-plan', { text: actionResponse, image: imageSrc });
-
-    //提取actionResponse中Action:开始的内容(包括Action:)
-    const actionText = actionResponse.match(/Action:\s*(.*)/)?.[1] || "";
-    
-      // Track Repetition
-      if (actionText === this.lastActionResponse) {
+        const actionLine = text.match(/Action:\s*(.*)/)?.[1] || "";
+        if (actionLine === this.lastActionResponse) {
           this.repeatActionCount++;
       } else {
           this.repeatActionCount = 1;
-          this.lastActionResponse = actionText;
-      }
+          this.lastActionResponse = actionLine;
+        }
 
-      count++;
-      await this.executeAction(actionText, width, height, scaleFactor, signal);
-      
-      if (actionText.includes("finished")) {
-        this.sendToMain('task-finished');
-        break;
-      }
-      
-      if (signal.aborted) break;
+        return {
+          actionResponseText: text,
+          actionLine,
+          finalInstructionForExecutor: `Instruction: ${state.instructionForUser || ""}\nAction: ${actionLine}`,
+        };
+      })
+      .addNode("build_executor_input", async (state: PigletStateType) => {
+        const actionType = state.actionType || "click";
+        return {
+          finalInstructionForExecutor: `Instruction: ${state.instructionForUser || ""}\nActionType: ${actionType}`,
+        };
+      })
+      .addNode("execute", async (state: PigletStateType) => {
+        if (signal.aborted) throw new Error("Aborted");
+        const exec = await this.executeViaExecutorModel({
+          instruction: state.finalInstructionForExecutor || "",
+          modelImageWidth: state.modelW || 0,
+          modelImageHeight: state.modelH || 0,
+          scaleFactor: state.scaleFactor || 1,
+          signal,
+        });
+
+        // UI: show tool call (name + schema + args) instead of raw Action model output / ActionType.
+        const imageSrc = `data:image/png;base64,${state.screenshotB64 || ""}`;
+        this.sendToMain("agent-action-plan", { text: exec.displayText, image: imageSrc });
+
+        const at = state.actionType;
+        const alsoFinished =
+          exec.finished ||
+          (state.actionLine || "").includes("finished") ||
+          at === "finished";
+
+        return { finished: alsoFinished };
+      })
+      .addNode("post", async (state: PigletStateType) => {
+        // IMPORTANT: when task is finished (Action: finished), notify renderer to flip UI state back.
+        if (state.finished) {
+          this.sendToMain("task-finished");
+          return { finished: true };
+        }
+        return { step: (state.step || 0) + 1 };
+      })
+      .addNode("sleep", async () => {
       await sleep(2000, signal);
-    }
-  }
-
-  private async captureScreen() {
-    // No need to hide/show overlay thanks to setContentProtection(true)
-    const imgBuffer = await screenshot({ format: 'png' });
-    const screenSize = robot.getScreenSize();
-    const jimpImage = await jimp.read(imgBuffer);
-    
-    const scaleFactor = jimpImage.bitmap.width / screenSize.width;
-    const MAX_PIXELS = 2116800;
-
-    // Draw previous step overlay into current screenshot for LLM (UI-TARS-like)
-    if (this.pendingScreenshotOverlay) {
-        try {
-            await this.drawOverlayIntoScreenshot(jimpImage, this.pendingScreenshotOverlay, scaleFactor);
-        } catch (e) {
-            console.warn('[captureScreen] drawOverlayIntoScreenshot failed', e);
-        } finally {
-            // Apply only once: "previous action" overlay
-            this.pendingScreenshotOverlay = null;
-        }
-    }
-    
-    let newWidth = jimpImage.bitmap.width;
-    let newHeight = jimpImage.bitmap.height;
-    
-    if (newWidth * newHeight > MAX_PIXELS) {
-        const factor = Math.sqrt(MAX_PIXELS / (newWidth * newHeight));
-        newWidth = Math.floor(newWidth * factor);
-        newHeight = Math.floor(newHeight * factor);
-        jimpImage.resize(newWidth, newHeight);
-    }
-    
-    const base64 = (await jimpImage.getBufferAsync(jimp.MIME_PNG)).toString('base64');
-    
-    return {
-        base64,
-        width: newWidth, 
-        height: newHeight, 
-        scaleFactor
-    };
-  }
-
-  private async drawOverlayIntoScreenshot(
-    image: any,
-    overlay: NonNullable<DualAgentService['pendingScreenshotOverlay']>,
-    scaleFactor: number,
-  ) {
-    const clamp = (n: number, min: number, max: number) => Math.max(min, Math.min(max, n));
-    const toPx = (v: number | undefined) =>
-      v == null ? undefined : Math.round(v * scaleFactor);
-
-    const W = image.bitmap.width;
-    const H = image.bitmap.height;
-
-    const font = await jimp.loadFont(jimp.FONT_SANS_16_WHITE);
-    const labelText = overlay.label || '';
-
-    const drawLabel = async (px: number, py: number, text: string) => {
-      const maxTextWidth = 260;
-      const textW = jimp.measureText(font, text);
-      const boxW = clamp(textW + 16, 60, maxTextWidth + 16);
-      const boxH = 28;
-      const bg = await new jimp(boxW, boxH, 0x000000aa);
-      bg.print(
-        font,
-        8,
-        6,
-        {
-          text,
-          alignmentX: jimp.HORIZONTAL_ALIGN_LEFT,
-          alignmentY: jimp.VERTICAL_ALIGN_MIDDLE,
+        return {};
+      })
+      .addEdge(START, "capture")
+      .addEdge("capture", "build_thought_prompt")
+      .addEdge("build_thought_prompt", "call_advanced")
+      .addConditionalEdges(
+        "call_advanced",
+        (state: PigletStateType) => {
+          const at = state.actionType;
+          if (at && ["hotkey", "type", "finished", "wait"].includes(at)) return "build_executor_input";
+          return "build_action_prompt";
         },
-        boxW - 16,
-        boxH - 12,
-      );
-      // place near the marker, avoid going offscreen
-      const x = clamp(px + 18, 0, W - boxW - 2);
-      const y = clamp(py - boxH - 18, 0, H - boxH - 2);
-      image.composite(bg, x, y);
-    };
+        ["build_executor_input", "build_action_prompt"],
+      )
+      .addEdge("build_action_prompt", "call_action")
+      .addEdge("call_action", "execute")
+      .addEdge("build_executor_input", "execute")
+      .addEdge("execute", "post")
+      .addConditionalEdges(
+        "post",
+        (state: PigletStateType) => (state.finished ? END : "sleep"),
+        [END, "sleep"],
+      )
+      .addEdge("sleep", "capture")
+      .compile();
 
-    const drawRing = (px: number, py: number, radius: number, thickness: number) => {
-      const r2 = radius * radius;
-      const inner = radius - thickness;
-      const inner2 = inner * inner;
-      const minX = clamp(px - radius - 2, 0, W - 1);
-      const maxX = clamp(px + radius + 2, 0, W - 1);
-      const minY = clamp(py - radius - 2, 0, H - 1);
-      const maxY = clamp(py + radius + 2, 0, H - 1);
-      for (let y = minY; y <= maxY; y++) {
-        for (let x = minX; x <= maxX; x++) {
-          const dx = x - px;
-          const dy = y - py;
-          const d2 = dx * dx + dy * dy;
-          if (d2 <= r2 && d2 >= inner2) {
-            image.setPixelColor(0xff2a2aff, x, y); // bright red ring
-          } else if (d2 < inner2) {
-            // subtle fill to improve visibility
-            // only fill close to center a bit (keep light)
-            if (d2 < (inner2 * 0.25)) {
-              image.setPixelColor(0xff2a2a33, x, y);
-            }
-          }
-        }
+    // LangGraph 默认 recursionLimit=25（按“节点执行次数”计，不是按“轮数”计）
+    // 我们每一轮会跑多个节点（capture/build/call/execute/post/sleep...），所以需要显式提高上限。
+    const estimatedNodesPerLoop = 12;
+    const maxSteps = 30;
+    const recursionLimit = Math.max(200, maxSteps * estimatedNodesPerLoop + 50);
+
+    await graph.invoke(
+      {
+        userQuery: instruction,
+        step: 0,
+        advancedHistory: [],
+      } as any,
+      { recursionLimit } as any,
+    );
+  }
+
+  // screenshot + overlay helpers moved to utils.ts
+  private async selectAdvancedRulesPrompt(query: string) {
+    if (!query || !query.trim()) return "";
+    const alwaysInject = (this.currentConfig?.rules || [])
+      .filter((r: any) => r && !!r.enabled && !!(r.alwaysInject ?? false) && (r.content || "").trim().length > 0)
+      .map((r: any) => (r.content || "").trim());
+
+    let dynamic = "";
+    if (this.advancedRuleSelector) {
+      try {
+        const selected = await this.advancedRuleSelector.selectExamples({ input: query });
+        const parts = (selected || [])
+          .map((ex: any) => String((ex?.content ?? ex?.input ?? "")).trim())
+          .filter((s: string) => s.length > 0);
+        dynamic = parts.join("\n\n");
+      } catch (e) {
+        console.warn("[advancedRuleSelector] selectExamples failed, skip dynamic rules injection.", e);
+        dynamic = "";
       }
-    };
-
-    if (overlay.kind === 'hotkey') {
-      // Place a bottom-center banner
-      const text = `hotkey: ${labelText}`;
-      const textW = jimp.measureText(font, text);
-      const boxW = clamp(textW + 24, 140, 420);
-      const boxH = 34;
-      const bg = await new jimp(boxW, boxH, 0x000000aa);
-      bg.print(font, 12, 9, text);
-      const x = Math.round((W - boxW) / 2);
-      const y = clamp(H - boxH - 36, 0, H - boxH - 2);
-      image.composite(bg, x, y);
-      return;
     }
 
-    const px = toPx(overlay.x);
-    const py = toPx(overlay.y);
-    if (px == null || py == null) return;
-
-    // Bigger and clearer than current on-screen overlay: radius 28, thickness 6
-    drawRing(px, py, 28, 6);
-    await drawLabel(px, py, labelText);
-  }
-  private constructThoughtPrompt(instruction: string, extraPrompt?: string) {
-    return `You are a GUI agent. You are given a task and action history, with screenshots of user's current screen. You need to perform the next action to complete the task. 
-
-# ## Output Format
-# \`\`\`
-# Thought: ...
-# \`\`\`
-
-# ## Action Space
-click, left_double, right_single, drag, hotkey, type, scroll, wait, finished
-
-# ## Note
-# - Use Chinese in \`Thought\` part.
-# - Write a small plan and finally summarize your next action (with its target element) in one sentence in \`Thought\` part.
-# - You only need to write the "Thought" section; there's no need to provide overly detailed instructions.
-# - Make sure that your Thought contains only one action(click,key press and etc) at a time.
-# - Further actions are on hold, and next plan will be revised after the user provides feedback with a screenshot (since the user's operation might be wrong; if current step fails, you need to adjust your instructions or find other solutions until that step is correctly resolved, so you cannot skip steps).
-# - If a command repeatedly fails, you need to adjust your instructions to make them clearer! Your user might be clueless, and repeatedly using the same command/method won't lead to the correct outcome.
-# - Make SURE Only One Action(one of the above actions) At A Response! No such things like "输入xxx并回车" since "输入" and "回车" are two different actions.
-# - Your output should not include any coordinate information, only pure text descriptions. The details should be left for the user to handle.
-
-# ## Output Example
-# Instruction: 我需要打开 VSCode 应用程序。在底部的 Dock 栏中，我可以看到 VSCode 的图标（蓝色图标，位于终端图标和另一个深色图标之间）。
-#下一步操作：点击 Dock 栏中的 VSCode 图标以打开应用程序。
-
-# ## Extra Prompt
-${extraPrompt}
-# ## User Instruction
-${instruction}`;
+    const parts = [...(dynamic ? [dynamic] : []), ...alwaysInject].filter((x) => x && x.trim().length > 0);
+    // simple de-dup
+    const dedup: string[] = [];
+    const seen = new Set<string>();
+    for (const p of parts) {
+      if (seen.has(p)) continue;
+      seen.add(p);
+      dedup.push(p);
+    }
+    return dedup.join("\n\n");
   }
 
-  private constructActionPrompt(thought: string, extraPrompt?: string) {
-    return `You are a GUI agent. You are given a action instruction, with screenshots. You need to perform the next action(follow the instruction strictly dont think too much, do what the instruction ask you to do) to complete the task. 
+  private buildThoughtHistoryForThisTurn(opts: {
+    step: number;
+    screenshotBase64: string;
+    userQuery: string;
+    advancedExtraPrompt: string;
+  }): BaseMessage[] {
+    const { step, screenshotBase64, userQuery, advancedExtraPrompt } = opts;
 
-## Output Format
-\`\`\`
-Action: ...
-\`\`\`
+    let history = [...this.advancedHistory];
 
-## Action Space
+    if (step <= 0) {
+      const systemPrompt = buildAdvancedSystemPrompt({ advancedExtraPrompt, userQuery });
 
-click(start_box='<|box_start|>(x1, y1)<|box_end|>')
-left_double(start_box='<|box_start|>(x1, y1)<|box_end|>')
-right_single(start_box='<|box_start|>(x1, y1)<|box_end|>')
-drag(start_box='<|box_start|>(x1, y1)<|box_end|>', end_box='<|box_start|>(x3, y3)<|box_end|>')
-hotkey(key='')
-type(content='') #If you want to submit your input, use "\\n" at the end of \`content\`.
-scroll(start_box='<|box_start|>(x1, y1)<|box_end|>', direction='down or up or right or left')
-wait() #Sleep for 5s and take a screenshot to check for any changes.
-finished(content='xxx') # Use escape characters \\', \\", and \\n in content part to ensure we can parse the content in normal python string format.
+      history = [new SystemMessage(systemPrompt)];
 
-# ## Note
-# - Make SURE Only One Action At A Time!
-# - Even if the instructions contain two consecutive actions, you can only output one action at a time.
-# - For example, 'type(content='xxx') \nhotkey(key='enter')' is not allowed in one output, you should only output 'type(content='xxx')'instead.
-# - You must 100% follow the instruction strictly, if instructions tell you to press whichever keyboard shortcut you must do 100% the same.
+      const msg = new HumanMessage({
+        content: [{ type: "image_url", image_url: { url: `data:image/png;base64,${screenshotBase64}` } }],
+      } as any);
+      return [...history, msg];
+    }
 
+    // tutorial.py: if len(history) > 10, delete first 2 (excluding first SystemMessage)
+    if (history.length > 10) {
+      history = [history[0], ...history.slice(3)];
+    }
 
-## Extra Prompt
-${extraPrompt}
-## User Instruction
-${thought}`;
+    const prompt = buildAdvancedFollowupPrompt({ advancedExtraPrompt });
+
+    const msg = new HumanMessage({
+      content: [
+        { type: "image_url", image_url: { url: `data:image/png;base64,${screenshotBase64}` } },
+        { type: "text", text: prompt },
+      ],
+    } as any);
+
+    return [...history, msg];
   }
 
-  private async callAdvancedModel(base64Image: string, prompt: string) {
-    if (!this.advancedClient || !this.currentConfig) throw new Error("Advanced Client not initialized");
+  private async callAdvancedStructured(history: BaseMessage[]): Promise<ThoughtResponse> {
+    if (!this.advancedModel) throw new Error("Advanced model not initialized");
+    const llm = (this.advancedModel as any).withStructuredOutput(ThoughtResponseSchema);
 
-    const messages = [
-        ...this.advancedHistory,
-        {
-            role: "user",
-            content: [
-                { type: "image_url", image_url: { url: `data:image/png;base64,${base64Image}` } },
-                { type: "text", text: prompt }
-            ]
-        }
-    ];
-    
-    const completion = await this.advancedClient.chat.completions.create({
-        model: this.currentConfig.advancedModel.modelName,
-        messages: messages as any,
-        temperature: 0
-    });
-    
-    const content = completion.choices[0].message.content || "";
-    this.advancedHistory.push({ role: "user", content: prompt });
-    this.advancedHistory.push({ role: "assistant", content });
-    return content;
+    const res = await llm.invoke(history);
+    // when withStructuredOutput is available, res is already an object; otherwise it is a message
+    if (typeof res === "object" && res && "Thought" in res && "Instruction" in res && "ActionType" in res) {
+      return res as ThoughtResponse;
+    }
+    // fallback: try parse as JSON (best-effort)
+    try {
+      const obj = JSON.parse((res?.content ?? "").toString());
+      return ThoughtResponseSchema.parse(obj);
+    } catch {
+      return { Thought: "", Instruction: "", ActionType: "click" };
+    }
   }
 
-  private async callActionModel(base64Image: string, prompt: string) {
-    if (!this.actionClient || !this.currentConfig) throw new Error("Action Client not initialized");
-
-     const messages = [
-        // ...this.actionHistory,
-        {
-            role: "user",
-            content: [
-                { type: "image_url", image_url: { url: `data:image/png;base64,${base64Image}` } },
-                { type: "text", text: prompt }
-            ]
-        }
-    ];
+  private async callActionV2(base64Image: string, prompt: string) {
+    if (!this.actionModel) throw new Error("Action model not initialized");
+    const msg = new HumanMessage({
+      content: [
+        { type: "image_url", image_url: { url: `data:image/png;base64,${base64Image}` } },
+        { type: "text", text: prompt },
+      ],
+    } as any);
     
     const maxAttempts = 2;
+    let last = "";
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-        const completion = await this.actionClient.chat.completions.create({
-            model: this.currentConfig.actionModel.modelName,
-            messages: messages as any,
-            temperature: 0
-        });
-        
-        const content = completion.choices[0].message.content || "";
-        const hasAction = content.includes("Action:");
-        
-        if (hasAction) {
-            // Only record valid outputs to avoid polluting history
-            this.actionHistory.push({ role: "user", content: prompt });
-            this.actionHistory.push({ role: "assistant", content });
-            return content;
-        }
-        
-        console.warn(`[ActionModel] Missing "Action:" in response (attempt ${attempt}/${maxAttempts}). Retrying once...`, content);
-        // Do NOT record invalid output; retry once.
+      const ai = await this.actionModel.invoke([msg]);
+      last = ((ai.content as any) || "").toString();
+      if (last.includes("Action:")) return last;
+      console.warn(`[ActionModel] Missing "Action:" in response (attempt ${attempt}/${maxAttempts}). Retrying once...`, last);
     }
-    
-    // If still invalid after retry, return last content without recording
-    return "";
+    return last;
   }
 
-  private parseAction(actionStr: string) {
-      // Improved regex to capture action name and arguments
-      const match = actionStr.match(/^([a-z_]+)\((.*)\)$/);
-      if (!match) return null;
-      
-      const actionType = match[1];
-      const argsStr = match[2];
-      const args: any = {};
-      
-      // Extract content='...'
-      const contentMatch = argsStr.match(/content='((?:[^'\\]|\\.)*)'/);
-      if (contentMatch) args.content = contentMatch[1];
-      
-      // Extract key='...'
-      const keyMatch = argsStr.match(/key='([^']+)'/);
-      if (keyMatch) args.key = keyMatch[1];
-      
-      // Extract start_box='(x,y)'
-      const startBoxMatch = argsStr.match(/start_box=['"]?(?:<\|box_start\|>)?[\(\[](\d+),\s*(\d+)[\)\]](?:<\|box_end\|>)?['"]?/);
-      if (startBoxMatch) {
-          args.start_box = [parseInt(startBoxMatch[1]), parseInt(startBoxMatch[2])];
-      }
-      
-      // Extract end_box='(x,y)'
-      const endBoxMatch = argsStr.match(/end_box=['"]?(?:<\|box_start\|>)?[\(\[](\d+),\s*(\d+)[\)\]](?:<\|box_end\|>)?['"]?/);
-      if (endBoxMatch) {
-          args.end_box = [parseInt(endBoxMatch[1]), parseInt(endBoxMatch[2])];
-      }
-      
-      // Extract direction
-      const dirMatch = argsStr.match(/direction='([^']+)'/);
-      if (dirMatch) args.direction = dirMatch[1];
+  private async executeViaExecutorModel(opts: {
+    instruction: string;
+    modelImageWidth: number;
+    modelImageHeight: number;
+    scaleFactor: number;
+    signal: AbortSignal;
+  }): Promise<{ finished: boolean; displayText: string }> {
+    if (!this.executorModel) throw new Error("Executor model not initialized");
+    const { instruction, modelImageWidth, modelImageHeight, scaleFactor, signal } = opts;
 
-      return { actionType, args };
+    // NOTE: LangChain tool typings can get extremely deep in TS; keep runtime behavior but erase types.
+    const toolsByName = this.buildExecutorTools({
+      modelImageWidth,
+      modelImageHeight,
+      scaleFactor,
+      signal,
+    }) as Record<string, any>;
+    const tools = Object.values(toolsByName) as any[];
+    const modelWithTools = (this.executorModel as any).bindTools
+      ? (this.executorModel as any).bindTools(tools as any)
+      : this.executorModel;
+
+    const systemPrompt = buildExecutorSystemPrompt({ instruction });
+    const ai = await modelWithTools.invoke([
+      new SystemMessage(systemPrompt),
+      new HumanMessage("Convert instruction into exactly one tool call."),
+    ]);
+
+    const toolCalls =
+      (ai as any).tool_calls ||
+      (ai as any).additional_kwargs?.tool_calls ||
+      (ai as any).additional_kwargs?.toolCalls ||
+      [];
+
+    if (!toolCalls.length) {
+      throw new Error("Executor model did not call any tool.");
+    }
+
+    const call = toolCalls[0];
+    const name = call.name;
+    const args = call.args ?? call.arguments ?? {};
+    const toolImpl = (toolsByName as any)[name];
+    if (!toolImpl) {
+      throw new Error(`Unknown tool called by executor model: ${name}`);
+    }
+
+    const schema = getExecutorToolSchemaText(String(name || ""));
+    const displayText =
+      `Tool Call:\n` +
+      `- name: ${String(name || "")}\n` +
+      `- schema: ${schema}\n` +
+      `- args: ${JSON.stringify(args ?? {}, null, 2)}`;
+
+    const result = await toolImpl.invoke(args);
+    const finished = !!(result && (result as any).finished);
+    return { finished, displayText };
   }
 
-  private async executeAction(actionResponse: string, modelImageWidth: number, modelImageHeight: number, scaleFactor: number, signal: AbortSignal) {
-    if (signal.aborted) return;
-    
-    const screenSize = robot.getScreenSize();
-    console.log(`Action Response: ${actionResponse}`);
-    
-    const cleanAction = actionResponse.replace(/^Action:\s*/, '').trim();
-    const parsed = this.parseAction(cleanAction);
-    
-    if (!parsed) {
-        console.log("Failed to parse action:", cleanAction);
-        return;
-    }
-    
-    const { actionType, args } = parsed;
-    
-    const mapCoords = (x: number, y: number) => {
-        const logicalX = (x / modelImageWidth) * screenSize.width;
-        const logicalY = (y / modelImageHeight) * screenSize.height;
-        return { x: logicalX, y: logicalY };
+  // getExecutorToolSchemaText moved to utils.ts
+
+
+
+
+  // Executor tools Builder
+  private buildExecutorTools(opts: {
+    modelImageWidth: number;
+    modelImageHeight: number;
+    scaleFactor: number;
+    signal: AbortSignal;
+  }): Record<string, any> {
+    const { modelImageWidth, modelImageHeight, scaleFactor, signal } = opts;
+    const act = async (action: string) => {
+      const { pendingOverlay } = await executeUiTarsAction({
+        actionResponse: action,
+        modelImageWidth,
+        modelImageHeight,
+        scaleFactor,
+        signal,
+        sendToOverlay: (channel, payload) => this.sendToOverlay(channel, payload),
+      });
+      if (pendingOverlay) this.pendingScreenshotOverlay = pendingOverlay;
+      return { ok: true };
     };
 
-    // --- Strictly Following UI-TARS Logic via RobotJS Adaptation ---
+    const click: any = tool(
+      async ({ x, y }: { x: number; y: number }) =>
+        act(`Action: click(start_box='<|box_start|>(${x}, ${y})<|box_end|>')`),
+      {
+        name: "click",
+        description: "Left click once at (x, y). Coordinates are PIXELS in the current screenshot.",
+        schema: z.object({ x: z.number().int(), y: z.number().int() }) as any,
+      },
+    ) as any;
 
-    switch (actionType) {
-        case 'click':
-        case 'left_click':
-        case 'left_single':
-            if (args.start_box) {
-                const { x, y } = mapCoords(args.start_box[0], args.start_box[1]);
-                robot.moveMouse(x, y); 
-                this.sendToOverlay('draw-highlight', { type: 'click', x, y });
-                await sleep(100, signal); 
-                if (signal.aborted) return;
-                robot.mouseClick();
-                // annotate next screenshot
-                this.pendingScreenshotOverlay = { kind: 'click', x, y, label: 'click' };
-            }
-            break;
-            
-        case 'left_double':
-        case 'double_click':
-            if (args.start_box) {
-                const { x, y } = mapCoords(args.start_box[0], args.start_box[1]);
-                robot.moveMouse(x, y);
-                this.sendToOverlay('draw-highlight', { type: 'double_click', x, y });
-                await sleep(100, signal);
-                if (signal.aborted) return;
-                robot.mouseClick('left');
-                await sleep(10, signal); // within system double-click threshold
-                if (signal.aborted) return;
-                robot.mouseClick('left', true); 
-                // robot.mouseClick('left');
-                // await sleep(10, signal); // within system double-click threshold
-                // if (signal.aborted) return;
-                // robot.mouseClick('left');
-                this.pendingScreenshotOverlay = {
-                  kind: 'double_click',
-                  x,
-                  y,
-                  label: 'left double click',
-                };
-            }
-            break;
+    const left_double: any = tool(
+      async ({ x, y }: { x: number; y: number }) =>
+        act(`Action: left_double(start_box='<|box_start|>(${x}, ${y})<|box_end|>')`),
+      {
+        name: "left_double",
+        description: "Left double click at (x, y). Coordinates are PIXELS in the current screenshot.",
+        schema: z.object({ x: z.number().int(), y: z.number().int() }) as any,
+      },
+    ) as any;
 
-        case 'right_single':
-        case 'right_click':
-            if (args.start_box) {
-                const { x, y } = mapCoords(args.start_box[0], args.start_box[1]);
-                robot.moveMouse(x, y);
-                this.sendToOverlay('draw-highlight', { type: 'right_click', x, y });
-                await sleep(100, signal);
-                if (signal.aborted) return;
-                robot.mouseClick('right');
-                this.pendingScreenshotOverlay = { kind: 'right_click', x, y, label: 'right click' };
-            }
-            break;
+    const right_single: any = tool(
+      async ({ x, y }: { x: number; y: number }) =>
+        act(`Action: right_single(start_box='<|box_start|>(${x}, ${y})<|box_end|>')`),
+      {
+        name: "right_single",
+        description: "Right click once at (x, y). Coordinates are PIXELS in the current screenshot.",
+        schema: z.object({ x: z.number().int(), y: z.number().int() }) as any,
+      },
+    ) as any;
 
-        case 'middle_click':
-            if (args.start_box) {
-                const { x, y } = mapCoords(args.start_box[0], args.start_box[1]);
-                robot.moveMouse(x, y);
-                this.sendToOverlay('draw-highlight', { type: 'middle_click', x, y });
-                robot.mouseClick('middle'); 
-                this.pendingScreenshotOverlay = { kind: 'middle_click', x, y, label: 'middle click' };
-            }
-            break;
+    const drag: any = tool(
+      async ({
+        start_x,
+        start_y,
+        end_x,
+        end_y,
+      }: {
+        start_x: number;
+        start_y: number;
+        end_x: number;
+        end_y: number;
+      }) =>
+        act(
+          `Action: drag(start_box='<|box_start|>(${start_x}, ${start_y})<|box_end|>', end_box='<|box_start|>(${end_x}, ${end_y})<|box_end|>')`,
+        ),
+      {
+        name: "drag",
+        description: "Drag from (start_x, start_y) to (end_x, end_y). Coordinates are PIXELS in the current screenshot.",
+        schema: z.object({
+          start_x: z.number().int(),
+          start_y: z.number().int(),
+          end_x: z.number().int(),
+          end_y: z.number().int(),
+        }) as any,
+      },
+    ) as any;
 
-        case 'drag':
-        case 'left_click_drag':
-        case 'select':
-            if (args.start_box && args.end_box) {
-                const start = mapCoords(args.start_box[0], args.start_box[1]);
-                const end = mapCoords(args.end_box[0], args.end_box[1]);
-                
-                this.sendToOverlay('draw-highlight', { 
-                    type: 'drag', 
-                    startX: start.x, startY: start.y, 
-                    endX: end.x, endY: end.y 
-                });
-                
-                robot.moveMouse(start.x, start.y);
-                await sleep(100, signal);
-                if (signal.aborted) return;
-                robot.mouseToggle('down');
-                robot.dragMouse(end.x, end.y); 
-                robot.mouseToggle('up');
-            }
-            break;
+    const hotkey: any = tool(
+      async ({ key }: { key: string }) => act(`Action: hotkey(key='${escapeSingleQuotes(key)}')`),
+      {
+        name: "hotkey",
+        description: "Press a keyboard shortcut. Example: key='cmd+f' or key='ctrl+v' or key='enter'.",
+        schema: z.object({ key: z.string() }) as any,
+      },
+    ) as any;
 
-        case 'mouse_move':
-        case 'hover':
-            if (args.start_box) {
-                const { x, y } = mapCoords(args.start_box[0], args.start_box[1]);
-                robot.moveMouse(x, y);
-                this.sendToOverlay('draw-highlight', { type: 'hover', x, y });
-            }
-            break;
-            
-        case 'type':
-            if (args.content) {
-                console.log(`Typing: ${args.content}`);
-                const content = args.content;
-                const stripContent = content.replace(/\\n$/, '').replace(/\n$/, '');
-                
-                this.sendToOverlay('draw-highlight', { type: 'type', x: 0, y: 0, text: content });
-                
-                if (process.platform === 'win32') {
-                    clipboard.writeText(stripContent);
-                    robot.keyTap('v', 'control');
-                    await sleep(50, signal);
-                } else {
-                    clipboard.writeText(stripContent);
-                    robot.keyTap('v', 'command');
-                    await sleep(50, signal);
-                }
-                
-                if (content.endsWith('\n') || content.endsWith('\\n')) {
-                    if (signal.aborted) return;
-                    robot.keyTap('enter');
-                }
-            }
-            break;
-            
-        case 'hotkey':
-        case 'press':
-            if (args.key) {
-                const keys = args.key.toLowerCase().split(/[\s+]/); 
-                const modifiers: string[] = [];
-                let mainKey = '';
-                
-                keys.forEach((k: string) => {
-                    const mapped = mapKey(k);
-                    if (['command', 'control', 'alt', 'shift'].includes(mapped)) {
-                        modifiers.push(mapped);
-                    } else {
-                        mainKey = mapped;
-                    }
-                });
-                
-                if (mainKey) {
-                    console.log(`Hotkey: ${mainKey} + [${modifiers}]`);
-                    this.sendToOverlay('draw-highlight', { type: 'hotkey', text: args.key });
-                    robot.keyTap(mainKey, modifiers);
-                    this.pendingScreenshotOverlay = { kind: 'hotkey', label: args.key };
-                }
-            }
-            break;
-            
-        case 'scroll':
-            if (args.direction) {
-                if (args.start_box) {
-                     const { x, y } = mapCoords(args.start_box[0], args.start_box[1]);
-                     robot.moveMouse(x, y);
-                }
-                
-                const magnitude = 10;
-                this.sendToOverlay('draw-highlight', { type: 'scroll', text: args.direction });
-                
-                if (args.direction === 'down') robot.scrollMouse(0, -magnitude);
-                if (args.direction === 'up') robot.scrollMouse(0, magnitude);
-            }
-            break;
-            
-        case 'wait':
-            this.sendToOverlay('draw-highlight', { type: 'wait' });
-            await sleep(5000, signal);
-            break;
-            
-        case 'finished':
-            break;
-            
-        default:
-            console.log("Unhandled action:", actionType);
-    }
+    const type: any = tool(
+      async ({ content }: { content: string }) =>
+        act(`Action: type(content='${escapeSingleQuotes(content)}')`),
+      {
+        name: "type",
+        description: "Type text into the currently focused input.",
+        schema: z.object({ content: z.string() }) as any,
+      },
+    ) as any;
+
+    const scroll: any = tool(
+      async ({
+        x,
+        y,
+        direction,
+      }: {
+        x: number;
+        y: number;
+        direction: "down" | "up" | "left" | "right";
+      }) =>
+        act(
+          `Action: scroll(start_box='<|box_start|>(${x}, ${y})<|box_end|>', direction='${direction}')`,
+        ),
+      {
+        name: "scroll",
+        description: "Scroll at (x, y) towards the given direction. Coordinates are PIXELS in the current screenshot.",
+        schema: z.object({
+          x: z.number().int(),
+          y: z.number().int(),
+          direction: z.enum(["down", "up", "left", "right"]),
+        }) as any,
+      },
+    ) as any;
+
+    const wait: any = tool(async () => act("Action: wait()"), {
+      name: "wait",
+      description: "Wait for 5 seconds (then the next loop will take a new screenshot).",
+      schema: z.object({}) as any,
+    }) as any;
+
+    const finished: any = tool(async ({ content }: { content?: string }) => ({ finished: true, content }), {
+      name: "finished",
+      description: "Finish the task. content is optional.",
+      schema: z.object({ content: z.string().optional() }) as any,
+    }) as any;
+
+    return {
+      click,
+      left_double,
+      right_single,
+      drag,
+      hotkey,
+      type,
+      scroll,
+      wait,
+      finished,
+    };
   }
+
+  // action parsing/execution moved to utils.ts
 }
