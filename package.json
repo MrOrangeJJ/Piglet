@@ -5,6 +5,7 @@
   "main": "dist-electron/index.js",
   "scripts": {
     "dev": "vite",
+    "postinstall": "electron-rebuild -f -w robotjs",
     "build": "tsc && vite build && electron-builder",
     "preview": "vite preview"
   },
