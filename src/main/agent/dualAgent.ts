@@ -822,21 +822,27 @@ export class DualAgentService {
         x,
         y,
         direction,
+        magnitude,
       }: {
         x: number;
         y: number;
         direction: "down" | "up" | "left" | "right";
+        magnitude?: number;
       }) =>
         act(
-          `Action: scroll(start_box='<|box_start|>(${x}, ${y})<|box_end|>', direction='${direction}')`,
+          `Action: scroll(start_box='<|box_start|>(${x}, ${y})<|box_end|>', direction='${direction}'${
+            magnitude != null ? `, magnitude=${Math.trunc(magnitude)}` : ""
+          })`,
         ),
       {
         name: "scroll",
-        description: "Scroll at (x, y) towards the given direction. Coordinates are PIXELS in the current screenshot.",
+        description:
+          "Scroll at (x, y) towards the given direction. Coordinates are PIXELS in the current screenshot. magnitude controls scroll amount (default is 1). You should make this decision based on the task",
         schema: z.object({
           x: z.number().int(),
           y: z.number().int(),
           direction: z.enum(["down", "up", "left", "right"]),
+          magnitude: z.number().int().min(1).max(10).optional(),
         }) as any,
       },
     ) as any;

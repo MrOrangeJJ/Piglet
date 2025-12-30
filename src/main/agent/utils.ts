@@ -75,7 +75,7 @@ export function getExecutorToolSchemaText(toolName: string) {
     drag: "{ start_x: int, start_y: int, end_x: int, end_y: int }",
     hotkey: "{ key: string }",
     type: "{ content: string }",
-    scroll: "{ x: int, y: int, direction: 'down' | 'up' | 'left' | 'right' }",
+    scroll: "{ x: int, y: int, direction: 'down' | 'up' | 'left' | 'right', magnitude?: int (default 10) }",
     wait: "{}",
     finished: "{ content?: string }",
   };
@@ -91,7 +91,10 @@ export type PendingScreenshotOverlay =
         | "middle_click"
         | "drag"
         | "hover"
-        | "hotkey";
+        | "hotkey"
+        | "scroll"
+        | "type"
+        | "wait";
       x?: number; // logical screen coords
       y?: number;
       startX?: number;
@@ -113,30 +116,32 @@ export async function drawOverlayIntoScreenshot(
   const W = image.bitmap.width;
   const H = image.bitmap.height;
 
-  const font = await jimp.loadFont(jimp.FONT_SANS_16_WHITE);
+  // Make overlay text much larger for readability (≈4x)
+  const TEXT_SCALE = 4;
+  const font = await jimp.loadFont(jimp.FONT_SANS_64_WHITE);
   const labelText = overlay.label || "";
 
   const drawLabel = async (px: number, py: number, text: string) => {
-    const maxTextWidth = 260;
+    const maxTextWidth = 260 * TEXT_SCALE;
     const textW = jimp.measureText(font, text);
-    const boxW = clamp(textW + 16, 60, maxTextWidth + 16);
-    const boxH = 28;
+    const boxW = clamp(textW + 16 * TEXT_SCALE, 60 * TEXT_SCALE, maxTextWidth + 16 * TEXT_SCALE);
+    const boxH = 28 * TEXT_SCALE;
     const bg = await new jimp(boxW, boxH, 0x000000aa);
     bg.print(
       font,
-      8,
-      6,
+      8 * TEXT_SCALE,
+      6 * TEXT_SCALE,
       {
         text,
         alignmentX: jimp.HORIZONTAL_ALIGN_LEFT,
         alignmentY: jimp.VERTICAL_ALIGN_MIDDLE,
       },
-      boxW - 16,
-      boxH - 12,
+      boxW - 16 * TEXT_SCALE,
+      boxH - 12 * TEXT_SCALE,
     );
     // place near the marker, avoid going offscreen
-    const x = clamp(px + 18, 0, W - boxW - 2);
-    const y = clamp(py - boxH - 18, 0, H - boxH - 2);
+    const x = clamp(px + 18 * TEXT_SCALE, 0, W - boxW - 2);
+    const y = clamp(py - boxH - 18 * TEXT_SCALE, 0, H - boxH - 2);
     image.composite(bg, x, y);
   };
 
@@ -166,17 +171,81 @@ export async function drawOverlayIntoScreenshot(
     }
   };
 
-  if (overlay.kind === "hotkey") {
-    // Place a bottom-center banner
-    const text = `hotkey: ${labelText}`;
+  const drawBanner = async (text: string) => {
     const textW = jimp.measureText(font, text);
-    const boxW = clamp(textW + 24, 140, 420);
-    const boxH = 34;
+    const boxW = clamp(textW + 24 * TEXT_SCALE, 140 * TEXT_SCALE, 420 * TEXT_SCALE);
+    const boxH = 34 * TEXT_SCALE;
     const bg = await new jimp(boxW, boxH, 0x000000aa);
-    bg.print(font, 12, 9, text);
+    bg.print(font, 12 * TEXT_SCALE, 9 * TEXT_SCALE, text);
     const x = Math.round((W - boxW) / 2);
-    const y = clamp(H - boxH - 36, 0, H - boxH - 2);
+    const y = clamp(H - boxH - 36 * TEXT_SCALE, 0, H - boxH - 2);
     image.composite(bg, x, y);
+  };
+
+  const drawLine = (x1: number, y1: number, x2: number, y2: number, thickness: number) => {
+    const clampInt = (v: number, min: number, max: number) => Math.max(min, Math.min(max, Math.round(v)));
+    x1 = clampInt(x1, 0, W - 1);
+    y1 = clampInt(y1, 0, H - 1);
+    x2 = clampInt(x2, 0, W - 1);
+    y2 = clampInt(y2, 0, H - 1);
+
+    const dx = Math.abs(x2 - x1);
+    const sx = x1 < x2 ? 1 : -1;
+    const dy = -Math.abs(y2 - y1);
+    const sy = y1 < y2 ? 1 : -1;
+    let err = dx + dy;
+    let x = x1;
+    let y = y1;
+    while (true) {
+      for (let ty = -thickness; ty <= thickness; ty++) {
+        for (let tx = -thickness; tx <= thickness; tx++) {
+          const px = x + tx;
+          const py = y + ty;
+          if (px >= 0 && px < W && py >= 0 && py < H) image.setPixelColor(0xff2a2aff, px, py);
+        }
+      }
+      if (x === x2 && y === y2) break;
+      const e2 = 2 * err;
+      if (e2 >= dy) {
+        err += dy;
+        x += sx;
+      }
+      if (e2 <= dx) {
+        err += dx;
+        y += sy;
+      }
+    }
+  };
+
+  // Banner-style overlays (no reliable point coordinate)
+  if (overlay.kind === "hotkey" || overlay.kind === "type" || overlay.kind === "wait") {
+    await drawBanner(`${overlay.kind}: ${labelText}`);
+    return;
+  }
+
+  // Drag overlay: draw a line and endpoints, plus label near end.
+  if (overlay.kind === "drag") {
+    const sx = toPx(overlay.startX);
+    const sy = toPx(overlay.startY);
+    const ex = toPx(overlay.endX);
+    const ey = toPx(overlay.endY);
+    if (sx == null || sy == null || ex == null || ey == null) return;
+    drawLine(sx, sy, ex, ey, 2);
+    drawRing(sx, sy, 22, 5);
+    drawRing(ex, ey, 26, 6);
+    await drawLabel(ex, ey, labelText || "drag");
+    return;
+  }
+
+  // Scroll overlay: prefer ring at scroll target if available, also show banner for direction/magnitude.
+  if (overlay.kind === "scroll") {
+    await drawBanner(`scroll: ${labelText}`);
+    const px = toPx(overlay.x);
+    const py = toPx(overlay.y);
+    if (px != null && py != null) {
+      drawRing(px, py, 22, 5);
+      await drawLabel(px, py, "scroll");
+    }
     return;
   }
 
@@ -300,6 +369,10 @@ export function parseUiTarsAction(actionStr: string): ParsedAction {
   const dirMatch = argsStr.match(/direction='([^']+)'/);
   if (dirMatch) args.direction = dirMatch[1];
 
+  // Extract magnitude (optional, executor tool only)
+  const magMatch = argsStr.match(/magnitude=(\d+)/) || argsStr.match(/magnitude='(\d+)'/);
+  if (magMatch) args.magnitude = parseInt(magMatch[1], 10);
+
   return { actionType, args };
 }
 
@@ -411,6 +484,14 @@ export async function executeUiTarsAction(opts: {
         robot.mouseToggle("down");
         robot.dragMouse(end.x, end.y);
         robot.mouseToggle("up");
+        pendingOverlay = {
+          kind: "drag",
+          startX: start.x,
+          startY: start.y,
+          endX: end.x,
+          endY: end.y,
+          label: "drag",
+        };
       }
       break;
 
@@ -420,6 +501,7 @@ export async function executeUiTarsAction(opts: {
         const { x, y } = mapCoords(args.start_box[0], args.start_box[1]);
         robot.moveMouse(x, y);
         opts.sendToOverlay("draw-highlight", { type: "hover", x, y });
+        pendingOverlay = { kind: "hover", x, y, label: "hover" };
       }
       break;
 
@@ -445,6 +527,10 @@ export async function executeUiTarsAction(opts: {
           if (opts.signal.aborted) return { pendingOverlay };
           robot.keyTap("enter");
         }
+        pendingOverlay = {
+          kind: "type",
+          label: `type: "${stripContent.slice(0, 32)}${stripContent.length > 32 ? "…" : ""}"`,
+        };
       }
       break;
 
@@ -490,22 +576,36 @@ export async function executeUiTarsAction(opts: {
 
     case "scroll":
       if (args.direction) {
+        let scrollTarget: { x: number; y: number } | null = null;
         if (args.start_box) {
           const { x, y } = mapCoords(args.start_box[0], args.start_box[1]);
           robot.moveMouse(x, y);
+          scrollTarget = { x, y };
         }
 
-        const magnitude = 10;
+        const rawMag = (args as any).magnitude;
+        const magnitude_beforeScroll = Number.isFinite(Number(rawMag)) ? Math.max(1, Math.min(10, Number(rawMag))) : 1;
+        const magnitude = magnitude_beforeScroll * 100;
         opts.sendToOverlay("draw-highlight", { type: "scroll", text: args.direction });
 
         if (args.direction === "down") robot.scrollMouse(0, -magnitude);
         if (args.direction === "up") robot.scrollMouse(0, magnitude);
+        if (args.direction === "left") robot.scrollMouse(-magnitude, 0);
+        if (args.direction === "right") robot.scrollMouse(magnitude, 0);
+
+        pendingOverlay = {
+          kind: "scroll",
+          x: scrollTarget?.x,
+          y: scrollTarget?.y,
+          label: `${args.direction} (x${magnitude_beforeScroll})`,
+        };
       }
       break;
 
     case "wait":
       opts.sendToOverlay("draw-highlight", { type: "wait" });
       await sleep(5000, opts.signal);
+      pendingOverlay = { kind: "wait", label: "wait" };
       break;
 
     case "finished":
