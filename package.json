@@ -1,6 +1,6 @@
 {
   "name": "piglet-app",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "description": "Piglet - A dual-LLM macOS agent app based on UI-TARS-desktop architecture",
   "main": "dist-electron/index.js",
   "scripts": {
@@ -16,6 +16,7 @@
     "@langchain/core": "1.1.8",
     "@langchain/langgraph": "^1.0.7",
     "@langchain/openai": "^1.2.0",
+    "@langchain/classic": "^1.0.7",
     "clsx": "^2.1.1",
     "electron-store": "^8.2.0",
     "jimp": "^0.22.10",
