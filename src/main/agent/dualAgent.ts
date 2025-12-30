@@ -16,7 +16,7 @@ import {
   captureScreenB64,
   executeUiTarsAction,
   escapeSingleQuotes,
-  getExecutorToolSchemaText,
+  // getExecutorToolSchemaText,
   selfTestMouseMovement,
   sleep,
   type PendingScreenshotOverlay,
@@ -704,11 +704,10 @@ export class DualAgentService {
       throw new Error(`Unknown tool called by executor model: ${name}`);
     }
 
-    const schema = getExecutorToolSchemaText(String(name || ""));
+    // const schema = getExecutorToolSchemaText(String(name || ""));
     const displayText =
       `Tool Call:\n` +
       `- name: ${String(name || "")}\n` +
-      `- schema: ${schema}\n` +
       `- args: ${JSON.stringify(args ?? {}, null, 2)}`;
 
     const result = await toolImpl.invoke(args);
