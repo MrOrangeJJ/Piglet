@@ -683,7 +683,7 @@ export class DualAgentService {
     const systemPrompt = buildExecutorSystemPrompt({ instruction });
     const ai = await modelWithTools.invoke([
       new SystemMessage(systemPrompt),
-      new HumanMessage("Convert instruction into exactly one tool call."),
+      new HumanMessage("Convert action_text into exactly one tool call. You will see something in this format '(start_box='<|box_start|>(x,y)<|box_end|>'), please follow the coordinate strictly, first is x , second is y ."),
     ]);
 
     const toolCalls =
