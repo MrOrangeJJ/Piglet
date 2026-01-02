@@ -13,10 +13,12 @@ export function buildAdvancedSystemPrompt(opts: { advancedExtraPrompt: string; u
 # - Your output should not include any coordinate information, only pure text descriptions. The details should be left for the user to handle.
 
 # ## Output Example
-# Instruction: 我需要打开 VSCode 应用程序。在底部的 Dock 栏中，我可以看到 VSCode 的图标（蓝色图标，位于终端图标和另一个深色图标之间）。
-#下一步操作：点击 Dock 栏中的 VSCode 图标以打开应用程序。
+# Thought: 我需要打开 VSCode 应用程序。在底部的 Dock 栏中，我可以看到 VSCode 的图标（蓝色图标，位于终端图标和另一个深色图标之间）。
+# Instruction: 点击 Dock 栏中的 VSCode 图标以打开应用程序。
+# ActionType: click
 
-# ## Extra Prompt
+
+# ## Extra Prompt(This extra prompt is the suggestion from the previous experience, it is highly valuable for you to complete the task)
 {advanced_extra}
 
 # ## User Instruction
@@ -32,7 +34,7 @@ export function buildAdvancedFollowupPrompt(opts: { advancedExtraPrompt: string 
   const { advancedExtraPrompt } = opts;
   // tutorial.py follow-up prompt EXACT
   const promptTemplate =
-    "这是user执行过上一次操作后的屏幕截图，请你继续指示下一步操作(***注意务必根据当前截图判断用户上一部是否正确的执行了要求的操作！如果没有请你继续换一种请你换一种指式方法/想想其他办法/更详细的描述来操作上一步。) ##Related Prompts:\n{}";
+    "这两张截图分别是用户过上一次在屏幕上执行的操作标识图和执行完该操作后等待2s后的屏幕截图, \n请你根据这两张截图判断用户上一部是否正确的执行了要求的操作, \n并请你继续指示下一步操作(***如果没有请你继续换一种请你换一种指式方法/想想其他办法/更详细的描述来操作上一步。) \n##Related Prompts(This related prompt is the suggestion from the previous experience, it is highly valuable for you to complete the task):\n{}";
   return promptTemplate.replace("{}", advancedExtraPrompt || "");
 }
 

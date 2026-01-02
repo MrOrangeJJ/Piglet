@@ -30,6 +30,7 @@ export default defineConfig({
                       'jimp',
                       'openai',
                       'langchain',
+                      '@napi-rs/canvas',
                       '@langchain/openai',
                       '@langchain/langgraph',
                       '@langchain/core',

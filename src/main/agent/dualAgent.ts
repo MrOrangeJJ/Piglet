@@ -14,9 +14,11 @@ import {
 } from './promptTemplate';
 import {
   captureScreenB64,
+  computePendingOverlayFromToolCall,
   executeUiTarsAction,
   escapeSingleQuotes,
-  // getExecutorToolSchemaText,
+  getExecutorToolSchemaText,
+  resetRobotInputState,
   selfTestMouseMovement,
   sleep,
   type PendingScreenshotOverlay,
@@ -45,7 +47,7 @@ const ACTION_TYPES = [
 const ThoughtResponseSchema = z.object({
   // 对齐 tutorial.py 的 Pydantic Field(description=...)
   Thought: z.string().describe("what have you see in the screenshot and based on that, your thought on what should you do next to complete the task/why"),
-  Instruction: z.string().describe("clear instruction to the user, in chinese"),
+  Instruction: z.string().describe("clear and short instruction to the user, in chinese"),
   // View: z.string(),
   ActionType: z
     .enum(ACTION_TYPES)
@@ -81,6 +83,11 @@ const PigletState = Ann.Root({
 
   finalInstructionForExecutor: Ann({ default: () => undefined }),
   finished: Ann({ default: () => undefined }),
+
+  // Executor planned tool call (computed before executing)
+  plannedToolName: Ann({ default: () => undefined }),
+  plannedToolArgs: Ann({ default: () => undefined }),
+  plannedToolDisplayText: Ann({ default: () => undefined }),
 });
 
 type PigletStateType = any;
@@ -318,9 +325,9 @@ export class DualAgentService {
               examples as any,
               embeddings as any,
               MemoryVectorStore as any,
-              { k: 2, inputKeys: ["input"] } as any,
+              { k: 3, inputKeys: ["input"] } as any,
             );
-          } catch (e) {
+    } catch (e) {
             console.warn("[advancedRuleSelector] init failed, skip dynamic rules injection.", e);
             this.advancedRuleSelector = null;
           }
@@ -358,6 +365,8 @@ export class DualAgentService {
       }
     } finally {
       this.abortController = null;
+      // Extra safety: if we aborted mid-action, reset any stuck OS input state.
+      resetRobotInputState();
       // Always restore click-through even if the user was hovering the widget when it hides
       this.ensureOverlayClickThrough();
       this.sendToOverlay('show-widget', { visible: false });
@@ -371,6 +380,9 @@ export class DualAgentService {
         this.abortController.abort();
         this.abortController = null;
     }
+    // If aborted mid-action, robotjs might leave the OS in a stuck input state (mouse down / modifier down).
+    // This can cause the UI to require "double clicks" after stopping from the overlay.
+    resetRobotInputState();
     // Ensure overlay does not keep intercepting mouse
     this.ensureOverlayClickThrough();
     this.sendToOverlay('show-widget', { visible: false });
@@ -390,11 +402,24 @@ export class DualAgentService {
       .addNode("capture", async (state: PigletStateType) => {
         if (signal.aborted) throw new Error("Aborted");
         const { base64WithOverlay, base64Raw, width, height, scaleFactor, pendingOverlayAfter } =
+          await captureScreenB64({ pendingOverlay: null });
+        // this.pendingScreenshotOverlay = pendingOverlayAfter;
+        return {
+          // screenshotB64: base64WithOverlay, // 给 Advanced / UI 展示用：带 overlay
+          rawScreenshotB64: base64Raw,      // 给 Action 用：不带 overlay
+          modelW: width,
+          modelH: height,
+          scaleFactor,
+        };
+      })
+      .addNode("pre_capture", async (state: PigletStateType) => {
+        if (signal.aborted) throw new Error("Aborted");
+        const { base64WithOverlay, base64Raw, width, height, scaleFactor, pendingOverlayAfter } =
           await captureScreenB64({ pendingOverlay: this.pendingScreenshotOverlay });
         this.pendingScreenshotOverlay = pendingOverlayAfter;
         return {
           screenshotB64: base64WithOverlay, // 给 Advanced / UI 展示用：带 overlay
-          rawScreenshotB64: base64Raw,      // 给 Action 用：不带 overlay
+          // rawScreenshotB64: base64Raw,      // 给 Action 用：不带 overlay
           modelW: width,
           modelH: height,
           scaleFactor,
@@ -403,7 +428,6 @@ export class DualAgentService {
       .addNode("build_thought_prompt", async (state: PigletStateType) => {
         if (signal.aborted) throw new Error("Aborted");
         const step = state.step || 0;
-        const screenshotB64 = state.screenshotB64 || "";
         const queryForRules = step <= 0 ? state.userQuery : (state.thoughtResponse || "");
         const advancedExtraPrompt = await this.selectAdvancedRulesPrompt(queryForRules);
 
@@ -411,7 +435,8 @@ export class DualAgentService {
         this.advancedHistory = (state.advancedHistory || []) as any;
         const history = this.buildThoughtHistoryForThisTurn({
           step,
-          screenshotBase64: screenshotB64,
+          screenshotBase64: state.screenshotB64 || "",
+          rawScreenshotBase64: state.rawScreenshotB64 || "",
           userQuery: state.userQuery,
           advancedExtraPrompt,
         });
@@ -428,14 +453,12 @@ export class DualAgentService {
 
         // Fix: type action should NOT accidentally add trailing \\n (unless explicitly asked)
         let instr = (res.Instruction || "").toString();
-        if (res.ActionType === "type") {
-          const explicitEnter = /回车|enter|提交|确认|搜索/i.test(instr);
-          if (!explicitEnter) instr = instr.replace(/(\\n|\n)+$/g, "");
-        }
 
-        const imageSrc = `data:image/png;base64,${state.screenshotB64 || ""}`;
         const thoughtDisplay =
           `Thought: ${res.Thought}\n` + `Instruction: ${instr}\n` + `ActionType: ${res.ActionType}`;
+        
+        const imageSrc = `data:image/png;base64,${state.rawScreenshotB64 || ""}`;
+
         this.sendToMain("agent-thought", { text: thoughtDisplay, image: imageSrc });
 
         return {
@@ -475,9 +498,9 @@ export class DualAgentService {
           finalInstructionForExecutor: `Instruction: ${state.instructionForUser || ""}\nActionType: ${actionType}`,
         };
       })
-      .addNode("execute", async (state: PigletStateType) => {
+      .addNode("plan_overlay", async (state: PigletStateType) => {
         if (signal.aborted) throw new Error("Aborted");
-        const exec = await this.executeViaExecutorModel({
+        const planned = await this.prepareExecutorToolCall({
           instruction: state.finalInstructionForExecutor || "",
           modelImageWidth: state.modelW || 0,
           modelImageHeight: state.modelH || 0,
@@ -485,9 +508,33 @@ export class DualAgentService {
           signal,
         });
 
-        // UI: show tool call (name + schema + args) instead of raw Action model output / ActionType.
+        const pending = computePendingOverlayFromToolCall({
+          toolName: planned.toolName,
+          args: planned.toolArgs,
+          modelImageWidth: state.modelW || 0,
+          modelImageHeight: state.modelH || 0,
+        });
+        if (pending) this.pendingScreenshotOverlay = pending;
+
+        return {
+          plannedToolName: planned.toolName,
+          plannedToolArgs: planned.toolArgs,
+          plannedToolDisplayText: planned.displayText,
+        };
+      })
+      .addNode("execute", async (state: PigletStateType) => {
+        if (signal.aborted) throw new Error("Aborted");
+        const exec = await this.executePlannedToolCall({
+          toolName: state.plannedToolName,
+          toolArgs: state.plannedToolArgs,
+          modelImageWidth: state.modelW || 0,
+          modelImageHeight: state.modelH || 0,
+          scaleFactor: state.scaleFactor || 1,
+          signal,
+        });
+
         const imageSrc = `data:image/png;base64,${state.screenshotB64 || ""}`;
-        this.sendToMain("agent-action-plan", { text: exec.displayText, image: imageSrc });
+        this.sendToMain("agent-action-plan", { text: state.plannedToolDisplayText || "", image: imageSrc });
 
         const at = state.actionType;
         const alsoFinished =
@@ -506,7 +553,7 @@ export class DualAgentService {
         return { step: (state.step || 0) + 1 };
       })
       .addNode("sleep", async () => {
-      await sleep(2000, signal);
+      await sleep(800, signal);
         return {};
       })
       .addEdge(START, "capture")
@@ -522,8 +569,10 @@ export class DualAgentService {
         ["build_executor_input", "build_action_prompt"],
       )
       .addEdge("build_action_prompt", "call_action")
-      .addEdge("call_action", "execute")
-      .addEdge("build_executor_input", "execute")
+      .addEdge("call_action", "plan_overlay")
+      .addEdge("build_executor_input", "plan_overlay")
+      .addEdge("plan_overlay", "pre_capture")
+      .addEdge("pre_capture", "execute")
       .addEdge("execute", "post")
       .addConditionalEdges(
         "post",
@@ -585,10 +634,11 @@ export class DualAgentService {
   private buildThoughtHistoryForThisTurn(opts: {
     step: number;
     screenshotBase64: string;
+    rawScreenshotBase64: string;
     userQuery: string;
     advancedExtraPrompt: string;
   }): BaseMessage[] {
-    const { step, screenshotBase64, userQuery, advancedExtraPrompt } = opts;
+    const { step, screenshotBase64, rawScreenshotBase64, userQuery, advancedExtraPrompt } = opts;
 
     let history = [...this.advancedHistory];
 
@@ -598,7 +648,7 @@ export class DualAgentService {
       history = [new SystemMessage(systemPrompt)];
 
       const msg = new HumanMessage({
-        content: [{ type: "image_url", image_url: { url: `data:image/png;base64,${screenshotBase64}` } }],
+        content: [{ type: "image_url", image_url: { url: `data:image/png;base64,${rawScreenshotBase64}` } }],
       } as any);
       return [...history, msg];
     }
@@ -613,6 +663,7 @@ export class DualAgentService {
     const msg = new HumanMessage({
       content: [
         { type: "image_url", image_url: { url: `data:image/png;base64,${screenshotBase64}` } },
+        { type: "image_url", image_url: { url: `data:image/png;base64,${rawScreenshotBase64}` } },
         { type: "text", text: prompt },
       ],
     } as any);
@@ -622,9 +673,27 @@ export class DualAgentService {
 
   private async callAdvancedStructured(history: BaseMessage[]): Promise<ThoughtResponse> {
     if (!this.advancedModel) throw new Error("Advanced model not initialized");
-    const llm = (this.advancedModel as any).withStructuredOutput(ThoughtResponseSchema);
+    // IMPORTANT:
+    // LangChain's ChatOpenAI.withStructuredOutput defaults to `jsonSchema` for non-OpenAI model names,
+    // which uses `response_format: { type: "json_schema" }`.
+    // Many OpenAI-compatible providers (incl. some SiliconFlow Qwen/Thinking routes) don't support this and may
+    // return a non-standard error body without `choices`, causing OpenAI SDK parseChatCompletion to crash.
+    // Force a more compatible method.
+    const base = this.advancedModel as any;
+    const tryInvoke = async (method: "functionCalling" | "jsonMode") => {
+      const llm = base.withStructuredOutput(ThoughtResponseSchema, { method });
+      return await llm.invoke(history);
+    };
 
-    const res = await llm.invoke(history);
+    let res: any;
+    try {
+      res = await tryInvoke("functionCalling");
+    } catch (e: any) {
+      // Fallback: some OpenAI-compatible providers/models don't support tool/function calling reliably.
+      // jsonMode is more widely compatible (response_format: json_object).
+      console.warn("[callAdvancedStructured] functionCalling failed, falling back to jsonMode.", e?.message ?? e);
+      res = await tryInvoke("jsonMode");
+    }
     // when withStructuredOutput is available, res is already an object; otherwise it is a message
     if (typeof res === "object" && res && "Thought" in res && "Instruction" in res && "ActionType" in res) {
       return res as ThoughtResponse;
@@ -658,13 +727,13 @@ export class DualAgentService {
     return last;
   }
 
-  private async executeViaExecutorModel(opts: {
+  private async prepareExecutorToolCall(opts: {
     instruction: string;
     modelImageWidth: number;
     modelImageHeight: number;
     scaleFactor: number;
     signal: AbortSignal;
-  }): Promise<{ finished: boolean; displayText: string }> {
+  }): Promise<{ toolName: string; toolArgs: any; displayText: string }> {
     if (!this.executorModel) throw new Error("Executor model not initialized");
     const { instruction, modelImageWidth, modelImageHeight, scaleFactor, signal } = opts;
 
@@ -683,7 +752,7 @@ export class DualAgentService {
     const systemPrompt = buildExecutorSystemPrompt({ instruction });
     const ai = await modelWithTools.invoke([
       new SystemMessage(systemPrompt),
-      new HumanMessage("Convert action_text into exactly one tool call. You will see something in this format '(start_box='<|box_start|>(x,y)<|box_end|>'), please follow the coordinate strictly, first is x , second is y ."),
+      new HumanMessage("Convert action_text into exactly one tool call(make sure match the action type). You will see something in this format '(start_box='<|box_start|>(x,y)<|box_end|>'), please follow the coordinate strictly, first is x , second is y ."),
     ]);
 
     const toolCalls =
@@ -699,23 +768,41 @@ export class DualAgentService {
     const call = toolCalls[0];
     const name = call.name;
     const args = call.args ?? call.arguments ?? {};
-    const toolImpl = (toolsByName as any)[name];
-    if (!toolImpl) {
-      throw new Error(`Unknown tool called by executor model: ${name}`);
-    }
-
-    // const schema = getExecutorToolSchemaText(String(name || ""));
+    const schema = getExecutorToolSchemaText(String(name || ""));
     const displayText =
       `Tool Call:\n` +
       `- name: ${String(name || "")}\n` +
       `- args: ${JSON.stringify(args ?? {}, null, 2)}`;
 
-    const result = await toolImpl.invoke(args);
-    const finished = !!(result && (result as any).finished);
-    return { finished, displayText };
+    return { toolName: String(name || ""), toolArgs: args, displayText };
   }
 
-  // getExecutorToolSchemaText moved to utils.ts
+  private async executePlannedToolCall(opts: {
+    toolName: string;
+    toolArgs: any;
+    modelImageWidth: number;
+    modelImageHeight: number;
+    scaleFactor: number;
+    signal: AbortSignal;
+  }): Promise<{ finished: boolean }> {
+    if (!this.executorModel) throw new Error("Executor model not initialized");
+    const { toolName, toolArgs, modelImageWidth, modelImageHeight, scaleFactor, signal } = opts;
+
+    const toolsByName = this.buildExecutorTools({
+      modelImageWidth,
+      modelImageHeight,
+      scaleFactor,
+      signal,
+    }) as Record<string, any>;
+
+    const toolImpl = (toolsByName as any)[toolName];
+    if (!toolImpl) {
+      throw new Error(`Unknown tool called by executor model: ${toolName}`);
+    }
+    const result = await toolImpl.invoke(toolArgs ?? {});
+    const finished = !!(result && (result as any).finished);
+    return { finished };
+  }
 
 
 
@@ -737,7 +824,8 @@ export class DualAgentService {
         signal,
         sendToOverlay: (channel, payload) => this.sendToOverlay(channel, payload),
       });
-      if (pendingOverlay) this.pendingScreenshotOverlay = pendingOverlay;
+      // NOTE: pending overlay is computed in a dedicated LangGraph node BEFORE execute.
+      // Execute tool should be side-effect only (do NOT compute/update pending overlay here).
       return { ok: true };
     };
 

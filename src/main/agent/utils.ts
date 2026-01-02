@@ -2,6 +2,7 @@ import { clipboard } from "electron";
 import robot from "robotjs";
 import screenshot from "screenshot-desktop";
 import jimp from "jimp";
+import { createCanvas } from "@napi-rs/canvas";
 
 export const sleep = (ms: number, signal?: AbortSignal) =>
   new Promise((resolve, reject) => {
@@ -66,6 +67,39 @@ export const mapKey = (key: string): string => {
 export const escapeSingleQuotes = (s: string) =>
   (s ?? "").replace(/\\/g, "\\\\").replace(/'/g, "\\'");
 
+// Jimp built-in bitmap fonts don't support CJK glyphs; render non-ASCII as escapes so overlay is readable.
+export function truncateForOverlayLabel(input: string, maxLen: number) {
+  const s = String(input ?? "");
+  if (s.length <= maxLen) return s;
+  return s.slice(0, maxLen) + "…";
+}
+
+// Best-effort: reset OS input state after abort/stopping a task.
+// This prevents "every click needs two clicks" symptoms caused by a stuck mouse-down/modifier state.
+export function resetRobotInputState() {
+  try {
+    robot.mouseToggle("up", "left");
+  } catch {}
+  try {
+    robot.mouseToggle("up", "right");
+  } catch {}
+  try {
+    robot.mouseToggle("up", "middle");
+  } catch {}
+  try {
+    robot.keyToggle("command", "up");
+  } catch {}
+  try {
+    robot.keyToggle("control", "up");
+  } catch {}
+  try {
+    robot.keyToggle("alt", "up");
+  } catch {}
+  try {
+    robot.keyToggle("shift", "up");
+  } catch {}
+}
+
 // Executor tool schema: keep stable & human-readable (don't depend on LangChain internals)
 export function getExecutorToolSchemaText(toolName: string) {
   const schemas: Record<string, string> = {
@@ -105,6 +139,88 @@ export type PendingScreenshotOverlay =
     }
   | null;
 
+export function computePendingOverlayFromToolCall(opts: {
+  toolName: string;
+  args: Record<string, any>;
+  modelImageWidth: number;
+  modelImageHeight: number;
+}): PendingScreenshotOverlay {
+  const { toolName, args, modelImageWidth, modelImageHeight } = opts;
+  const screenSize = robot.getScreenSize();
+
+  const mapXY = (x: number, y: number) => {
+    const logicalX = (x / modelImageWidth) * screenSize.width;
+    const logicalY = (y / modelImageHeight) * screenSize.height;
+    return { x: logicalX, y: logicalY };
+  };
+
+  try {
+    switch (toolName) {
+      case "click": {
+        const x = Number(args?.x);
+        const y = Number(args?.y);
+        if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
+        const p = mapXY(x, y);
+        return { kind: "click", x: p.x, y: p.y, label: "click" };
+      }
+      case "left_double": {
+        const x = Number(args?.x);
+        const y = Number(args?.y);
+        if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
+        const p = mapXY(x, y);
+        return { kind: "double_click", x: p.x, y: p.y, label: "left double click" };
+      }
+      case "right_single": {
+        const x = Number(args?.x);
+        const y = Number(args?.y);
+        if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
+        const p = mapXY(x, y);
+        return { kind: "right_click", x: p.x, y: p.y, label: "right click" };
+      }
+      case "drag": {
+        const sx = Number(args?.start_x);
+        const sy = Number(args?.start_y);
+        const ex = Number(args?.end_x);
+        const ey = Number(args?.end_y);
+        if (![sx, sy, ex, ey].every((n) => Number.isFinite(n))) return null;
+        const s = mapXY(sx, sy);
+        const e = mapXY(ex, ey);
+        return { kind: "drag", startX: s.x, startY: s.y, endX: e.x, endY: e.y, label: "drag" };
+      }
+      case "hotkey": {
+        const key = String(args?.key ?? "");
+        if (!key.trim()) return null;
+        return { kind: "hotkey", label: key };
+      }
+      case "type": {
+        const content = String(args?.content ?? "");
+        const stripContent = content.replace(/\\n$/, "").replace(/\n$/, "");
+        return { kind: "type", label: `type: "${truncateForOverlayLabel(stripContent, 32)}"` };
+      }
+      case "wait": {
+        return { kind: "wait", label: "wait" };
+      }
+      case "scroll": {
+        const x = Number(args?.x);
+        const y = Number(args?.y);
+        const direction = String(args?.direction ?? "");
+        const rawMag = args?.magnitude;
+        const magBefore = Number.isFinite(Number(rawMag)) ? Math.max(1, Math.min(10, Number(rawMag))) : 1;
+        const label = `${direction} (x${magBefore})`;
+        if (Number.isFinite(x) && Number.isFinite(y)) {
+          const p = mapXY(x, y);
+          return { kind: "scroll", x: p.x, y: p.y, label };
+        }
+        return { kind: "scroll", label };
+      }
+      default:
+        return null;
+    }
+  } catch {
+    return null;
+  }
+}
+
 export async function drawOverlayIntoScreenshot(
   image: any,
   overlay: NonNullable<PendingScreenshotOverlay>,
@@ -118,31 +234,44 @@ export async function drawOverlayIntoScreenshot(
 
   // Make overlay text much larger for readability (≈4x)
   const TEXT_SCALE = 4;
-  const font = await jimp.loadFont(jimp.FONT_SANS_64_WHITE);
+  const FONT_SIZE = 16 * TEXT_SCALE; // 64px
+  const FONT_FAMILY =
+    '"PingFang SC","Hiragino Sans GB","Heiti SC","Microsoft YaHei",system-ui,-apple-system,sans-serif';
   const labelText = overlay.label || "";
 
+  const renderTextBoxPng = async (text: string, opts?: { maxWidth?: number }) => {
+    const maxWidth = opts?.maxWidth ?? 260 * TEXT_SCALE;
+    const paddingX = 12 * TEXT_SCALE;
+    const paddingY = 8 * TEXT_SCALE;
+    const lineHeight = Math.round(FONT_SIZE * 1.15);
+    const canvasMeasure = createCanvas(10, 10);
+    const mctx = canvasMeasure.getContext("2d");
+    mctx.font = `${FONT_SIZE}px ${FONT_FAMILY}`;
+    const textW = Math.ceil(mctx.measureText(text).width);
+    const boxW = clamp(textW + paddingX * 2, 60 * TEXT_SCALE, maxWidth + paddingX * 2);
+    const boxH = paddingY * 2 + lineHeight;
+
+    const canvas = createCanvas(boxW, boxH);
+    const ctx = canvas.getContext("2d");
+    // background
+    ctx.fillStyle = "rgba(0,0,0,0.66)";
+    ctx.fillRect(0, 0, boxW, boxH);
+    // text
+    ctx.font = `${FONT_SIZE}px ${FONT_FAMILY}`;
+    ctx.fillStyle = "white";
+    ctx.textBaseline = "top";
+    ctx.fillText(text, paddingX, paddingY);
+    return canvas.toBuffer("image/png");
+  };
+
   const drawLabel = async (px: number, py: number, text: string) => {
-    const maxTextWidth = 260 * TEXT_SCALE;
-    const textW = jimp.measureText(font, text);
-    const boxW = clamp(textW + 16 * TEXT_SCALE, 60 * TEXT_SCALE, maxTextWidth + 16 * TEXT_SCALE);
-    const boxH = 28 * TEXT_SCALE;
-    const bg = await new jimp(boxW, boxH, 0x000000aa);
-    bg.print(
-      font,
-      8 * TEXT_SCALE,
-      6 * TEXT_SCALE,
-      {
-        text,
-        alignmentX: jimp.HORIZONTAL_ALIGN_LEFT,
-        alignmentY: jimp.VERTICAL_ALIGN_MIDDLE,
-      },
-      boxW - 16 * TEXT_SCALE,
-      boxH - 12 * TEXT_SCALE,
-    );
-    // place near the marker, avoid going offscreen
+    const buf = await renderTextBoxPng(text);
+    const labelImg = await jimp.read(buf);
+    const boxW = labelImg.bitmap.width;
+    const boxH = labelImg.bitmap.height;
     const x = clamp(px + 18 * TEXT_SCALE, 0, W - boxW - 2);
     const y = clamp(py - boxH - 18 * TEXT_SCALE, 0, H - boxH - 2);
-    image.composite(bg, x, y);
+    image.composite(labelImg, x, y);
   };
 
   const drawRing = (px: number, py: number, radius: number, thickness: number) => {
@@ -172,14 +301,13 @@ export async function drawOverlayIntoScreenshot(
   };
 
   const drawBanner = async (text: string) => {
-    const textW = jimp.measureText(font, text);
-    const boxW = clamp(textW + 24 * TEXT_SCALE, 140 * TEXT_SCALE, 420 * TEXT_SCALE);
-    const boxH = 34 * TEXT_SCALE;
-    const bg = await new jimp(boxW, boxH, 0x000000aa);
-    bg.print(font, 12 * TEXT_SCALE, 9 * TEXT_SCALE, text);
+    const buf = await renderTextBoxPng(text, { maxWidth: 420 * TEXT_SCALE });
+    const bannerImg = await jimp.read(buf);
+    const boxW = bannerImg.bitmap.width;
+    const boxH = bannerImg.bitmap.height;
     const x = Math.round((W - boxW) / 2);
     const y = clamp(H - boxH - 36 * TEXT_SCALE, 0, H - boxH - 2);
-    image.composite(bg, x, y);
+    image.composite(bannerImg, x, y);
   };
 
   const drawLine = (x1: number, y1: number, x2: number, y2: number, thickness: number) => {
@@ -482,8 +610,16 @@ export async function executeUiTarsAction(opts: {
         await sleep(100, opts.signal);
         if (opts.signal.aborted) return { pendingOverlay };
         robot.mouseToggle("down");
-        robot.dragMouse(end.x, end.y);
-        robot.mouseToggle("up");
+        try {
+          robot.dragMouse(end.x, end.y);
+        } finally {
+          // Always release mouse to avoid stuck "mouse down" if task is aborted mid-action
+          try {
+            robot.mouseToggle("up");
+          } catch {
+            // ignore
+          }
+        }
         pendingOverlay = {
           kind: "drag",
           startX: start.x,
@@ -529,7 +665,7 @@ export async function executeUiTarsAction(opts: {
         }
         pendingOverlay = {
           kind: "type",
-          label: `type: "${stripContent.slice(0, 32)}${stripContent.length > 32 ? "…" : ""}"`,
+          label: `type: "${truncateForOverlayLabel(stripContent, 32)}"`,
         };
       }
       break;
