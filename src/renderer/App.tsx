@@ -33,24 +33,40 @@ const App = () => {
   };
 
   useEffect(() => {
-    ipcRenderer.on('agent-thought', (_, payload: { text: string, image: string }) => {
-            setLogs(prev => [...prev, { 
-                text: payload.text, 
-                image: payload.image, 
-                timestamp: Date.now(), 
-                type: 'thought' 
+    ipcRenderer.on('agent-thought', (_, payload: { text: string }) => {
+            setLogs(prev => [...prev, {
+                text: payload.text,
+                timestamp: Date.now(),
+                type: 'thought'
             }]);
-            pushTaskImage(payload.image);
     });
     
-    ipcRenderer.on('agent-action-plan', (_, payload: { text: string, image: string }) => {
-            setLogs(prev => [...prev, { 
-                text: payload.text, 
-                image: payload.image, 
-                timestamp: Date.now(), 
-                type: 'action' 
+    ipcRenderer.on('agent-action-plan', (_, payload: { text: string }) => {
+            setLogs(prev => [...prev, {
+                text: payload.text,
+                timestamp: Date.now(),
+                type: 'action'
             }]);
-            // Keep all screenshots for this task.
+    });
+
+    ipcRenderer.on('agent-tool', (_, payload: { text: string }) => {
+            setLogs(prev => [...prev, {
+                text: payload.text,
+                timestamp: Date.now(),
+                type: 'tool'
+            }]);
+    });
+
+    ipcRenderer.on('agent-response', (_, payload: { text: string }) => {
+            setLogs(prev => [...prev, {
+                text: payload.text,
+                timestamp: Date.now(),
+                type: 'response'
+            }]);
+    });
+
+    // Dedicated image stream for Context View (no longer piggy-backed on thought/action logs)
+    ipcRenderer.on('agent-image', (_, payload: { image: string }) => {
             pushTaskImage(payload.image);
     });
 
@@ -77,6 +93,9 @@ const App = () => {
     return () => {
         ipcRenderer.removeAllListeners('agent-thought');
         ipcRenderer.removeAllListeners('agent-action-plan');
+        ipcRenderer.removeAllListeners('agent-tool');
+        ipcRenderer.removeAllListeners('agent-response');
+        ipcRenderer.removeAllListeners('agent-image');
         ipcRenderer.removeAllListeners('task-finished');
             ipcRenderer.removeAllListeners('task-error');
     };

@@ -12,7 +12,16 @@ contextBridge.exposeInMainWorld('electron', {
       }
     },
     on: (channel: string, func: (...args: any[]) => void) => {
-      let validChannels = ['agent-thought', 'agent-action-plan', 'task-finished', 'draw-highlight', 'task-error']
+      let validChannels = [
+        'agent-thought',
+        'agent-action-plan',
+        'agent-tool',
+        'agent-response',
+        'agent-image',
+        'task-finished',
+        'draw-highlight',
+        'task-error'
+      ]
       if (validChannels.includes(channel)) {
         // Deliberately strip event as it includes `sender` 
         ipcRenderer.on(channel, (event, ...args) => func(...args))

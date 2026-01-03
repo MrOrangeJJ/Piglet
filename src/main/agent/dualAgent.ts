@@ -478,7 +478,9 @@ export class DualAgentService {
         
         const imageSrc = `data:image/png;base64,${state.rawScreenshotB64 || ""}`;
 
-        this.sendToMain("agent-thought", { text: thoughtDisplay, image: imageSrc });
+        // Text-only event. Images are streamed via a dedicated `agent-image` event.
+        this.sendToMain("agent-thought", { text: thoughtDisplay });
+        this.sendToMain("agent-image", { image: imageSrc });
 
         return {
           thoughtResponse: res.Thought,
@@ -518,7 +520,7 @@ export class DualAgentService {
               const msg = String(e?.message ?? e);
               if (msg.includes("No Terminal tab found for tty")) {
                 tty = await openTerminalWindowAndGetTTY({ signal, timeoutMs: 20_000 });
-                this.sendToMain("agent-action-plan", { text: `[Terminal] session tty recreated: ${tty}`, image: undefined });
+                this.sendToMain("agent-tool", { text: `[Terminal] session tty recreated: ${tty}` });
                 const r = await runOnce();
                 stdout = r.stdout;
                 exitCode = r.exitCode;
@@ -528,8 +530,8 @@ export class DualAgentService {
             }
 
             const text = `Command:\n${command}\n\nExitCode: ${exitCode}\n\nOutput:\n${stdout}`;
-            // Optional: surface terminal output to UI for transparency
-            this.sendToMain("agent-action-plan", { text: `[Terminal]\n${text}`, image: undefined });
+            // Terminal tool output is usually long: render as `agent-tool` (collapsed by default in UI).
+            this.sendToMain("agent-tool", { text });
             return text;
           },
           {
@@ -563,12 +565,20 @@ export class DualAgentService {
           .filter((s) => s.length > 0);
         const finalAi = [...msgs].reverse().find((m) => m && (m._getType?.() === "ai" || m?.type === "ai"));
         const finalSummary = String(finalAi?.content ?? "").trim();
+        //获取msgs中最后一条消息的content
+        // const finalMessageContent = String(msgs[msgs.length - 1]?.content ?? "").trim();
+        // console.log("finalMessageContent", finalMessageContent);
+
+        if (finalSummary) {
+          // Final summary shown as normal response line
+          this.sendToMain("agent-response", { text: finalSummary });
+        }
 
         const merged =
           (finalSummary ? `Terminal 任务结果总结：\n${finalSummary}\n\n` : "") +
           (toolOutputs.length ? `Terminal 详细输出：\n\n${toolOutputs.join("\n\n---\n\n")}` : "");
 
-        return { terminalTaskResultText: merged || "Terminal 执行结束（无输出）。" };
+        return { terminalTaskResultText: merged || (finalSummary || "Terminal 执行结束（无输出）。") };
       })
       .addNode("terminal_history_node", async (state: PigletStateType) => {
         if (signal.aborted) throw new Error("Aborted");
@@ -591,6 +601,9 @@ export class DualAgentService {
             { type: "text", text: promptText },
           ],
         } as any);
+
+        // Context image stream
+        this.sendToMain("agent-image", { image: `data:image/png;base64,${base64Raw}` });
 
         const nextHistory = [...history, msg];
         return {
@@ -737,7 +750,9 @@ export class DualAgentService {
         });
 
         const imageSrc = `data:image/png;base64,${state.screenshotB64 || ""}`;
-        this.sendToMain("agent-action-plan", { text: state.plannedToolDisplayText || "", image: imageSrc });
+        // Text-only event. Images are streamed via `agent-image`.
+        this.sendToMain("agent-action-plan", { text: state.plannedToolDisplayText || "" });
+        this.sendToMain("agent-image", { image: imageSrc });
 
         const at = state.actionType;
         const alsoFinished =
