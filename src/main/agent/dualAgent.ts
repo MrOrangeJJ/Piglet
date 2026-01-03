@@ -4,13 +4,15 @@ import { SemanticSimilarityExampleSelector } from '@langchain/core/example_selec
 import { MemoryVectorStore } from '@langchain/classic/vectorstores/memory';
 import { HumanMessage, SystemMessage, type BaseMessage, AIMessage } from '@langchain/core/messages';
 import { Annotation, StateGraph, START, END } from '@langchain/langgraph';
-import { tool } from 'langchain';
+import { createAgent, tool } from 'langchain';
 import * as z from 'zod';
 import {
   buildActionPrompt,
   buildAdvancedFollowupPrompt,
   buildAdvancedSystemPrompt,
   buildExecutorSystemPrompt,
+  buildTerminalHistoryPrompt,
+  buildTerminalNodeSystemPrompt,
 } from './promptTemplate';
 import {
   captureScreenB64,
@@ -19,6 +21,8 @@ import {
   escapeSingleQuotes,
   getExecutorToolSchemaText,
   resetRobotInputState,
+  openTerminalWindowAndGetTTY,
+  runCommandInTerminalTTY,
   selfTestMouseMovement,
   sleep,
   type PendingScreenshotOverlay,
@@ -42,6 +46,7 @@ const ACTION_TYPES = [
   "scroll",
   "wait",
   "finished",
+  "terminal_task",
 ] as const;
 
 const ThoughtResponseSchema = z.object({
@@ -52,7 +57,7 @@ const ThoughtResponseSchema = z.object({
   ActionType: z
     .enum(ACTION_TYPES)
     .describe(
-      "left_double is double click, right_single is right click! Make sure dont use click when you need to double click(some very common action like open file need to use double click)",
+      "left_double is double click, right_single is right click!",
     ),
 });
 
@@ -97,6 +102,8 @@ const PigletState = Ann.Root({
 
   verityThink: Ann({ default: () => undefined }),
   verityCorrectness: Ann({ default: () => undefined }),
+
+  terminalTaskResultText: Ann({ default: () => undefined }),
 });
 
 type PigletStateType = any;
@@ -480,6 +487,123 @@ export class DualAgentService {
           advancedHistory: updatedHistory,
         };
       })
+      .addNode("terminal_node", async (state: PigletStateType) => {
+        if (signal.aborted) throw new Error("Aborted");
+        if (!this.advancedModel) throw new Error("Advanced model not initialized");
+
+        // Per requirement: entering terminal_node creates a NEW Terminal window/tab once,
+        // and all tool calls within this terminal_node reuse the SAME tab via tty.
+        let tty = await openTerminalWindowAndGetTTY({ signal, timeoutMs: 20_000 });
+
+        const terminal_run: any = tool(
+          async ({ command }: { command: string }) => {
+            // Always reuse the same tty inside this terminal_node.
+            // If user closes the tab/window, we auto-recreate a new session tty and retry once.
+            const runOnce = async () =>
+              await runCommandInTerminalTTY({
+                tty,
+                shellCommand: command,
+                signal,
+                pollIntervalMs: 250,
+                timeoutMs: 3 * 60_000,
+              });
+
+            let stdout = "";
+            let exitCode = 1;
+            try {
+              const r = await runOnce();
+              stdout = r.stdout;
+              exitCode = r.exitCode;
+            } catch (e: any) {
+              const msg = String(e?.message ?? e);
+              if (msg.includes("No Terminal tab found for tty")) {
+                tty = await openTerminalWindowAndGetTTY({ signal, timeoutMs: 20_000 });
+                this.sendToMain("agent-action-plan", { text: `[Terminal] session tty recreated: ${tty}`, image: undefined });
+                const r = await runOnce();
+                stdout = r.stdout;
+                exitCode = r.exitCode;
+              } else {
+                throw e;
+              }
+            }
+
+            const text = `Command:\n${command}\n\nExitCode: ${exitCode}\n\nOutput:\n${stdout}`;
+            // Optional: surface terminal output to UI for transparency
+            this.sendToMain("agent-action-plan", { text: `[Terminal]\n${text}`, image: undefined });
+            return text;
+          },
+          {
+            name: "terminal_run",
+            description:
+              "Run ONE shell command in visible macOS Terminal.app, capture its full output (stdout+stderr) and exit code.",
+            schema: z.object({ command: z.string().min(1) }) as any,
+          },
+        ) as any;
+
+        // LangGraph v1+ 标准实践：使用 langchain 内置的 createAgent（createReactAgent 已 deprecated）
+        const agent = createAgent({
+          model: this.advancedModel as any,
+          tools: [terminal_run] as any,
+          prompt: buildTerminalNodeSystemPrompt(),
+        } as any);
+
+        const taskGoal = (state.instructionForUser || "").toString().trim();
+        const result = await agent.invoke(
+          {
+            messages: [{ role: "user", content: `Terminal task goal:\n${taskGoal}` }],
+          } as any,
+          // Give the sub-agent enough recursion budget to do multi-step terminal work
+          { recursionLimit: 120 } as any,
+        );
+
+        const msgs: any[] = (result as any)?.messages || [];
+        const toolOutputs = msgs
+          .filter((m) => m && (m._getType?.() === "tool" || m?.type === "tool") && (m?.name === "terminal_run"))
+          .map((m) => String(m?.content ?? "").trim())
+          .filter((s) => s.length > 0);
+        const finalAi = [...msgs].reverse().find((m) => m && (m._getType?.() === "ai" || m?.type === "ai"));
+        const finalSummary = String(finalAi?.content ?? "").trim();
+
+        const merged =
+          (finalSummary ? `Terminal 任务结果总结：\n${finalSummary}\n\n` : "") +
+          (toolOutputs.length ? `Terminal 详细输出：\n\n${toolOutputs.join("\n\n---\n\n")}` : "");
+
+        return { terminalTaskResultText: merged || "Terminal 执行结束（无输出）。" };
+      })
+      .addNode("terminal_history_node", async (state: PigletStateType) => {
+        if (signal.aborted) throw new Error("Aborted");
+        const terminalResultText = (state.terminalTaskResultText || "").toString();
+
+        // Rehydrate advanced history from state, then append a terminal-result turn
+        this.advancedHistory = (state.advancedHistory || []) as any;
+        const history = [...this.advancedHistory];
+
+        // Capture a fresh screenshot for context (optional but helps when switching back to GUI steps)
+        const { base64WithOverlay, base64Raw, width, height, scaleFactor } = await captureScreenB64({
+          pendingOverlay: null,
+        });
+
+        const promptText = buildTerminalHistoryPrompt({ terminalResultText });
+        const msg = new HumanMessage({
+          content: [
+            // { type: "image_url", image_url: { url: `data:image/png;base64,${base64WithOverlay}` } },
+            { type: "image_url", image_url: { url: `data:image/png;base64,${base64Raw}` } },
+            { type: "text", text: promptText },
+          ],
+        } as any);
+
+        const nextHistory = [...history, msg];
+        return {
+          // This node "manages prompt" for the next advanced call (do not go build_thought_prompt)
+          advancedHistory: nextHistory,
+          rawScreenshotB64: base64Raw,
+          screenshotB64: base64WithOverlay,
+          modelW: width,
+          modelH: height,
+          scaleFactor,
+          step: (state.step || 0) + 1,
+        };
+      })
       .addNode("build_action_prompt", async (state: PigletStateType) => {
         return { actionPrompt: buildActionPrompt({ thought: state.instructionForUser || "", extraPrompt: "" }) };
       })
@@ -642,11 +766,14 @@ export class DualAgentService {
         "call_advanced",
         (state: PigletStateType) => {
           const at = state.actionType;
+          if (at === "terminal_task") return "terminal_node";
           if (at && ["hotkey", "type", "finished", "wait"].includes(at)) return "build_executor_input";
           return "build_action_prompt";
         },
-        ["build_executor_input", "build_action_prompt"],
+        ["terminal_node", "build_executor_input", "build_action_prompt"],
       )
+      .addEdge("terminal_node", "terminal_history_node")
+      .addEdge("terminal_history_node", "call_advanced")
       .addEdge("build_action_prompt", "call_action")
       .addEdge("call_action", "plan_overlay")
       .addEdge("build_executor_input", "plan_overlay")

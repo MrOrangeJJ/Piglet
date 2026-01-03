@@ -17,6 +17,11 @@ export function buildAdvancedSystemPrompt(opts: { advancedExtraPrompt: string; u
 # Thought: 我需要打开 VSCode 应用程序。在底部的 Dock 栏中，我可以看到 VSCode 的图标（蓝色图标，位于终端图标和另一个深色图标之间）。
 # Instruction: 点击 Dock 栏中的 VSCode 图标以打开应用程序。
 # ActionType: click
+#
+# ## Special ActionType: terminal_task
+# - Use ActionType: terminal_task ONLY when the next step(or next few steps) can be completed purely by Terminal commands (no visual UI interaction needed).
+# - In this case, Instruction should describe the terminal task goal clearly (what to achieve), not a GUI click instruction.
+# - If a step/muti-step can be completed purely by Terminal commands, you should use terminal_task action in highest priority.
 
 
 # ## Extra Prompt(This extra prompt is the suggestion from the previous experience, it is highly valuable for you to complete the task)
@@ -95,6 +100,29 @@ Your ONLY job: convert instruction into EXACTLY ONE tool call using the availabl
 
 ## Inputs/Instruction:
 ${instruction}`;
+}
+
+export function buildTerminalNodeSystemPrompt() {
+  return `You are a terminal automation agent inside an Electron app on macOS.
+
+You will be given a terminal task goal (in natural language). Your job is to complete it using Terminal commands.
+
+## Rules
+- You can call the tool "terminal_run" to run exactly ONE shell command per call.
+- After each tool result, you must decide the next best command or finish.
+- If the task is complete, STOP calling tools and provide a concise final result summary in Chinese.
+- Prefer safe, read-only commands when possible. If a command can be destructive, double-check and avoid unless explicitly required by the task.
+- If a command fails, inspect the output and try a corrected command.
+`;
+}
+
+export function buildTerminalHistoryPrompt(opts: { terminalResultText: string }) {
+  const { terminalResultText } = opts;
+  return `以下是刚刚通过 macOS Terminal 自动执行的任务结果（包含命令输出/关键信息）：
+
+${terminalResultText}
+
+请基于该结果继续完成整体任务的下一步（你可以回到 GUI 操作步骤，也可以再次选择 terminal_task）。`;
 }
 
 

@@ -3,6 +3,14 @@ import robot from "robotjs";
 import screenshot from "screenshot-desktop";
 import jimp from "jimp";
 import { createCanvas } from "@napi-rs/canvas";
+import * as os from "node:os";
+import * as path from "node:path";
+import * as fsSync from "node:fs";
+import { promises as fs } from "node:fs";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+
+const execFileAsync = promisify(execFile);
 
 export const sleep = (ms: number, signal?: AbortSignal) =>
   new Promise((resolve, reject) => {
@@ -98,6 +106,184 @@ export function resetRobotInputState() {
   try {
     robot.keyToggle("shift", "up");
   } catch {}
+}
+
+function escapeAppleScriptString(s: string) {
+  // Escape for AppleScript string literal: backslash + double quote + newline
+  return String(s ?? "")
+    .replace(/\\/g, "\\\\")
+    .replace(/"/g, '\\"')
+    .replace(/\r?\n/g, "\\n");
+}
+
+export async function openTerminalWindowAndGetTTY(opts?: {
+  signal?: AbortSignal;
+  timeoutMs?: number;
+}): Promise<string> {
+  const { signal, timeoutMs = 20_000 } = opts ?? {};
+  if (signal?.aborted) throw new Error("Aborted");
+
+  // Prefer creating a new window; fallback to opening a new tab in front window.
+  // Then wait until the tab's tty becomes available and return it.
+  const script = `
+tell application "Terminal"
+  activate
+  try
+    set w to (make new window)
+    set t to do script "" in w
+  on error
+    set t to do script ""
+  end try
+  repeat 120 times
+    try
+      set theTty to tty of t
+      if theTty is not "" then exit repeat
+    end try
+    delay 0.1
+  end repeat
+  return tty of t
+end tell
+`;
+
+  try {
+    const { stdout } = await execFileAsync("osascript", ["-e", script], { timeout: timeoutMs });
+    const tty = String(stdout ?? "").trim();
+    if (!tty || !tty.startsWith("/dev/")) {
+      throw new Error(`Failed to get tty from Terminal. Got: ${tty}`);
+    }
+    return tty;
+  } catch (e: any) {
+    throw new Error(`无法创建/定位 Terminal window 并获取 tty: ${e?.message ?? e}`);
+  }
+}
+
+export async function runCommandInTerminalTTY(opts: {
+  tty: string;
+  shellCommand: string;
+  signal?: AbortSignal;
+  pollIntervalMs?: number;
+  timeoutMs?: number;
+}): Promise<{ stdout: string; exitCode: number; outputPath: string; statusPath: string }> {
+  const { tty, shellCommand, signal, pollIntervalMs = 250, timeoutMs = 2 * 60_000 } = opts;
+  if (signal?.aborted) throw new Error("Aborted");
+  if (!tty || !tty.startsWith("/dev/")) throw new Error(`Invalid tty: ${tty}`);
+
+  const tempId = `${Date.now()}_${Math.random().toString(16).slice(2)}`;
+  const outputPath = path.join(os.tmpdir(), `piglet_terminal_out_${tempId}.log`);
+  const statusPath = path.join(os.tmpdir(), `piglet_terminal_status_${tempId}.log`);
+
+  try {
+    await fs.unlink(outputPath);
+  } catch {}
+  try {
+    await fs.unlink(statusPath);
+  } catch {}
+
+  // Show output in Terminal + capture via tee; preserve exit code of the command (not tee) using PIPESTATUS[0] in bash.
+  const pipeStatus0 = "${PIPESTATUS[0]}";
+  const inner = `bash -lc ${JSON.stringify(String(shellCommand ?? ""))} 2>&1 | tee "${outputPath}"; echo ${pipeStatus0} > "${statusPath}"`;
+  const wrappedCommand = `bash -lc ${JSON.stringify(inner)}`;
+
+  const script = `
+tell application "Terminal"
+  set targetTab to missing value
+  repeat with w in windows
+    repeat with t in tabs of w
+      try
+        if tty of t is "${escapeAppleScriptString(tty)}" then
+          set targetTab to t
+          exit repeat
+        end if
+      end try
+    end repeat
+    if targetTab is not missing value then exit repeat
+  end repeat
+  if targetTab is missing value then error "No Terminal tab found for tty: ${escapeAppleScriptString(tty)}"
+  activate
+  do script "${escapeAppleScriptString(wrappedCommand)}" in targetTab
+end tell
+`;
+
+  try {
+    await execFileAsync("osascript", ["-e", script], { timeout: 20_000 });
+  } catch (e: any) {
+    throw new Error(String(e?.message ?? e));
+  }
+
+  const start = Date.now();
+  while (true) {
+    if (signal?.aborted) throw new Error("Aborted");
+    if (Date.now() - start > timeoutMs) {
+      throw new Error(`Terminal 命令执行超时（>${timeoutMs}ms）: ${shellCommand}`);
+    }
+    if (fsSync.existsSync(statusPath)) break;
+    await sleep(pollIntervalMs, signal);
+  }
+
+  const stdout = await fs.readFile(outputPath, "utf8").catch(() => "");
+  const codeText = await fs.readFile(statusPath, "utf8").catch(() => "1");
+  const exitCode = Number.parseInt(String(codeText).trim(), 10);
+  return { stdout, exitCode: Number.isFinite(exitCode) ? exitCode : 1, outputPath, statusPath };
+}
+
+export async function runInVisibleTerminal(opts: {
+  shellCommand: string;
+  signal?: AbortSignal;
+  pollIntervalMs?: number;
+  timeoutMs?: number;
+}): Promise<{ stdout: string; exitCode: number; outputPath: string; statusPath: string }> {
+  const { shellCommand, signal, pollIntervalMs = 250, timeoutMs = 2 * 60_000 } = opts;
+
+  if (signal?.aborted) throw new Error("Aborted");
+  const tempId = `${Date.now()}_${Math.random().toString(16).slice(2)}`;
+  const outputPath = path.join(os.tmpdir(), `piglet_terminal_out_${tempId}.log`);
+  const statusPath = path.join(os.tmpdir(), `piglet_terminal_status_${tempId}.log`);
+
+  // Ensure clean slate
+  try {
+    await fs.unlink(outputPath);
+  } catch {}
+  try {
+    await fs.unlink(statusPath);
+  } catch {}
+
+  // Goal: user can SEE the live output in Terminal.app, while we also CAPTURE it for function return.
+  // Strategy: run command through `tee` (writes to file + prints to terminal).
+  // We need PIPESTATUS[0] to preserve the exit code of the command (not tee), so we ensure the outer shell is bash.
+  const pipeStatus0 = "${PIPESTATUS[0]}";
+  const inner = `bash -lc ${JSON.stringify(String(shellCommand ?? ""))} 2>&1 | tee "${outputPath}"; echo ${pipeStatus0} > "${statusPath}"`;
+  const wrappedCommand = `bash -lc ${JSON.stringify(inner)}`;
+
+  const script = `
+tell application "Terminal"
+  activate
+  do script "${escapeAppleScriptString(wrappedCommand)}"
+end tell
+`;
+
+  // Fire-and-forget Terminal execution (osascript itself returns immediately).
+  try {
+    await execFileAsync("osascript", ["-e", script], { timeout: 15_000 });
+  } catch (e: any) {
+    throw new Error(`无法启动 Terminal.app 或执行 AppleScript: ${e?.message ?? e}`);
+  }
+
+  const start = Date.now();
+  while (true) {
+    if (signal?.aborted) throw new Error("Aborted");
+    if (Date.now() - start > timeoutMs) {
+      throw new Error(`Terminal 命令执行超时（>${timeoutMs}ms）: ${shellCommand}`);
+    }
+
+    // statusPath is written at the end of wrappedCommand
+    if (fsSync.existsSync(statusPath)) break;
+    await sleep(pollIntervalMs, signal);
+  }
+
+  const stdout = await fs.readFile(outputPath, "utf8").catch(() => "");
+  const codeText = await fs.readFile(statusPath, "utf8").catch(() => "1");
+  const exitCode = Number.parseInt(String(codeText).trim(), 10);
+  return { stdout, exitCode: Number.isFinite(exitCode) ? exitCode : 1, outputPath, statusPath };
 }
 
 // Executor tool schema: keep stable & human-readable (don't depend on LangChain internals)
