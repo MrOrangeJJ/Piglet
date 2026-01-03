@@ -1,14 +1,23 @@
 import React from 'react';
-import { ChevronLeft, ChevronRight, Image as ImageIcon, Monitor } from 'lucide-react';
+import { ChevronLeft, ChevronRight, Image as ImageIcon, Monitor, Download } from 'lucide-react';
 
 interface ContextPanelProps {
     images: string[];
     activeIndex: number;
     onChangeIndex: (next: number) => void;
     showNavigator?: boolean;
+    canExportHistory?: boolean;
+    onExportHistory?: () => void;
 }
 
-export const ContextPanel = ({ images, activeIndex, onChangeIndex, showNavigator }: ContextPanelProps) => {
+export const ContextPanel = ({
+    images,
+    activeIndex,
+    onChangeIndex,
+    showNavigator,
+    canExportHistory,
+    onExportHistory,
+}: ContextPanelProps) => {
     const hasAny = images.length > 0 && activeIndex >= 0 && activeIndex < images.length;
     const img = hasAny ? images[activeIndex] : undefined;
     const canPrev = activeIndex > 0;
@@ -19,6 +28,18 @@ export const ContextPanel = ({ images, activeIndex, onChangeIndex, showNavigator
             <div className="p-4 border-b border-border bg-background flex items-center gap-2">
                 <Monitor size={18} className="text-muted-foreground" />
                 <h3 className="font-semibold text-sm">Context View</h3>
+                <div className="ml-auto flex items-center gap-2">
+                    <button
+                        type="button"
+                        onClick={onExportHistory}
+                        disabled={!canExportHistory}
+                        className="inline-flex items-center justify-center h-9 w-9 rounded-lg border border-border bg-background hover:bg-muted transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+                        title="Export Chat History"
+                        aria-label="Export Chat History"
+                    >
+                        <Download size={16} />
+                    </button>
+                </div>
             </div>
             
             <div className="flex-1 p-4 overflow-y-auto">

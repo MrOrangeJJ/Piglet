@@ -120,6 +120,8 @@ export class DualAgentService {
   private actionModel: ChatOpenAI | null = null;
   private executorModel: ChatOpenAI | null = null;
   private advancedHistory: BaseMessage[] = [];
+  // Keep last task's advanced history snapshot for export (until next task starts)
+  private lastFinishedAdvancedHistory: BaseMessage[] = [];
   private mainWindow: BrowserWindow;
   private overlayWindow: BrowserWindow;
   // LangChain 原生机制：语意相似规则选择器（只用于 Advanced rules 动态注入）
@@ -149,6 +151,28 @@ export class DualAgentService {
   constructor(mainWindow: BrowserWindow, overlayWindow: BrowserWindow) {
     this.mainWindow = mainWindow;
     this.overlayWindow = overlayWindow;
+  }
+
+  /** JSON-serializable export payload for Advanced history (prefers last finished snapshot). */
+  getAdvancedHistoryExportObject() {
+    const msgs = (this.lastFinishedAdvancedHistory?.length ? this.lastFinishedAdvancedHistory : this.advancedHistory) as any[];
+    const stored = (msgs || []).map((m: any) => {
+      // LangChain BaseMessage supports toDict() (StoredMessage) + toJSON() (Serializable)
+      if (m && typeof m.toDict === "function") return m.toDict();
+      if (m && typeof m.toJSON === "function") return m.toJSON();
+      return {
+        type: m?._getType?.() ?? m?.type ?? "unknown",
+        content: m?.content ?? "",
+        name: m?.name,
+        additional_kwargs: m?.additional_kwargs,
+        response_metadata: m?.response_metadata,
+      };
+    });
+    return {
+      exportedAt: new Date().toISOString(),
+      messageCount: stored.length,
+      messages: stored,
+    };
   }
 
   private minimizeMainWindowForTask() {
@@ -288,6 +312,8 @@ export class DualAgentService {
 
     this.currentConfig = config;
     this.advancedHistory = [];
+    // New task starts: clear last finished snapshot (export is for previous task)
+    this.lastFinishedAdvancedHistory = [];
     this.lastActionResponse = '';
     this.repeatActionCount = 0;
     
@@ -399,6 +425,12 @@ export class DualAgentService {
         this.abortController.abort();
         this.abortController = null;
     }
+    // Snapshot current advanced history for export even if user stops mid-run.
+    try {
+      this.lastFinishedAdvancedHistory = [...(this.advancedHistory || [])];
+    } catch {
+      this.lastFinishedAdvancedHistory = [];
+    }
     // If aborted mid-action, robotjs might leave the OS in a stuck input state (mouse down / modifier down).
     // This can cause the UI to require "double clicks" after stopping from the overlay.
     resetRobotInputState();
@@ -467,11 +499,12 @@ export class DualAgentService {
         const history = (state.advancedHistory || []) as any as BaseMessage[];
         const res = await this.callAdvancedStructured(history);
 
+        let instr = (res.Instruction || "").toString();
+
         // tutorial.py: push AIMessage(content=Thought) into history
-        const updatedHistory = [...history, new AIMessage(res.Thought)];
+        const updatedHistory = [...history, new AIMessage(`Thought: ${res.Thought}\nInstruction: ${instr}\nActionType: ${res.ActionType}`)];
 
         // Fix: type action should NOT accidentally add trailing \\n (unless explicitly asked)
-        let instr = (res.Instruction || "").toString();
 
         const thoughtDisplay =
           `Thought: ${res.Thought}\n` + `Instruction: ${instr}\n` + `ActionType: ${res.ActionType}`;
@@ -765,6 +798,12 @@ export class DualAgentService {
       .addNode("post", async (state: PigletStateType) => {
         // IMPORTANT: when task is finished (Action: finished), notify renderer to flip UI state back.
         if (state.finished) {
+          // Snapshot advanced history for export (persist until next task starts)
+          try {
+            this.lastFinishedAdvancedHistory = [...((state.advancedHistory || this.advancedHistory) as any[])];
+          } catch {
+            this.lastFinishedAdvancedHistory = [...(this.advancedHistory || [])];
+          }
           this.sendToMain("task-finished");
           return { finished: true };
         }

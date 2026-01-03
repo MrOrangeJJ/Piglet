@@ -140,6 +140,26 @@ const App = () => {
         }]);
     };
 
+  const handleExportChatHistory = async () => {
+        try {
+            const res: any = await (ipcRenderer as any).invoke?.('export-advanced-history');
+            if (res?.canceled) return;
+            if (res?.path) {
+                setLogs(prev => [...prev, {
+                    text: `Exported Advanced history (${res?.count ?? "?"} msgs): ${res.path}`,
+                    timestamp: Date.now(),
+                    type: 'system'
+                }]);
+            }
+        } catch (e: any) {
+            setLogs(prev => [...prev, {
+                text: `Export failed: ${e?.message ?? e}`,
+                timestamp: Date.now(),
+                type: 'system'
+            }]);
+        }
+    };
+
   return (
         <div className="flex h-screen w-screen overflow-hidden bg-background text-foreground font-sans">
             <Sidebar activeTab={activeTab} onTabChange={setActiveTab} />
@@ -164,6 +184,8 @@ const App = () => {
                                 activeIndex={activeImageIndex}
                                 onChangeIndex={setActiveImageIndex}
                                 showNavigator={hasFinished && taskImages.length > 1}
+                                canExportHistory={hasFinished && !isRunning}
+                                onExportHistory={handleExportChatHistory}
                             />
                         </div>
                     </>

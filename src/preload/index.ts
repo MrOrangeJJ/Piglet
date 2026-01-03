@@ -11,6 +11,14 @@ contextBridge.exposeInMainWorld('electron', {
         ipcRenderer.send(channel, data)
       }
     },
+    invoke: async (channel: string, ...args: any[]) => {
+      // whitelist invoke channels
+      const validChannels = ['get-settings', 'open-rules-json', 'export-advanced-history']
+      if (validChannels.includes(channel)) {
+        return await ipcRenderer.invoke(channel, ...args)
+      }
+      throw new Error(`Channel not allowed: ${channel}`)
+    },
     on: (channel: string, func: (...args: any[]) => void) => {
       let validChannels = [
         'agent-thought',

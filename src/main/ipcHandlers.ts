@@ -1,7 +1,9 @@
-import { IpcMain, BrowserWindow, shell } from 'electron';
+import { IpcMain, BrowserWindow, shell, dialog, app } from 'electron';
 import { DualAgentService, TaskStartPayload } from './agent/dualAgent';
 import { store, AppConfig } from './store';
 import { getRulesJsonPath, loadRulesFromFile, saveRulesToFile } from './rulesFile';
+import * as path from 'node:path';
+import { promises as fs } from 'node:fs';
 
 export function setupIpcHandlers(ipcMain: IpcMain, agentService: DualAgentService) {
   // Load settings
@@ -36,6 +38,27 @@ export function setupIpcHandlers(ipcMain: IpcMain, agentService: DualAgentServic
     const err = await shell.openPath(p);
     if (err) throw new Error(err);
     return { path: p };
+  });
+
+  // Export Advanced chat history (JSON) after a task finishes (kept until next task starts)
+  ipcMain.handle('export-advanced-history', async () => {
+    const payload = agentService.getAdvancedHistoryExportObject();
+    const count = Number(payload?.messageCount ?? 0);
+    if (!count) {
+      throw new Error('No Advanced history available to export (run a task first).');
+    }
+
+    const ts = new Date().toISOString().replace(/[:.]/g, '-');
+    const defaultPath = path.join(app.getPath('downloads'), `piglet-advanced-history-${ts}.json`);
+    const { canceled, filePath } = await dialog.showSaveDialog({
+      title: 'Export Chat History (Advanced)',
+      defaultPath,
+      filters: [{ name: 'JSON', extensions: ['json'] }],
+    });
+    if (canceled || !filePath) return { canceled: true };
+
+    await fs.writeFile(filePath, JSON.stringify(payload, null, 2), 'utf8');
+    return { canceled: false, path: filePath, count };
   });
 
   ipcMain.on('start-task', async (event, payload: TaskStartPayload) => {
