@@ -58,6 +58,12 @@ const ThoughtResponseSchema = z.object({
 
 type ThoughtResponse = z.infer<typeof ThoughtResponseSchema>;
 
+const VerityResponseSchema = z.object({
+  Think: z.string(),
+  Correctness: z.boolean(),
+});
+type VerityResponse = z.infer<typeof VerityResponseSchema>;
+
 // LangGraph TS 的 Annotation 类型在复杂工程里容易触发 TS 推导/缓存问题。
 // 这里把 Annotation 相关类型降级为 any，避免阻塞开发；运行时逻辑不受影响。
 const Ann: any = Annotation;
@@ -88,6 +94,9 @@ const PigletState = Ann.Root({
   plannedToolName: Ann({ default: () => undefined }),
   plannedToolArgs: Ann({ default: () => undefined }),
   plannedToolDisplayText: Ann({ default: () => undefined }),
+
+  verityThink: Ann({ default: () => undefined }),
+  verityCorrectness: Ann({ default: () => undefined }),
 });
 
 type PigletStateType = any;
@@ -282,6 +291,9 @@ export class DualAgentService {
             apiKey: config.advancedModel.apiKey,
             configuration: { baseURL: config.advancedModel.baseUrl },
             temperature: 0,
+            // We implement our own bounded retry for advanced structured output.
+            // Disable internal exponential backoff retries to avoid long stalls on flaky providers.
+            maxRetries: 0,
         });
         
         this.actionModel = new ChatOpenAI({
@@ -522,6 +534,73 @@ export class DualAgentService {
           plannedToolDisplayText: planned.displayText,
         };
       })
+//       .addNode("verity", async (state: PigletStateType) => {
+//         if (signal.aborted) throw new Error("Aborted");
+//         if (!this.currentConfig) throw new Error("Config not initialized");
+
+//         const screenshotB64 = state.screenshotB64 || "";
+//         const instructionForUser = (state.instructionForUser || "").toString();
+//         const actionType = (state.actionType || "").toString();
+//         const thoughtResponse = (state.thoughtResponse || "").toString();
+
+//         // NOTE: verity is a single-shot check (no history). Reuse advanced model settings, but create a fresh client.
+//         const verityModel = new ChatOpenAI({
+//           model: this.currentConfig.advancedModel.modelName,
+//           apiKey: this.currentConfig.advancedModel.apiKey,
+//           configuration: { baseURL: this.currentConfig.advancedModel.baseUrl },
+//           temperature: 0,
+//         });
+// // Be extremely strict: if there is ANY ambiguity, any off-by-a-bit, or it might click the wrong element, return Correctness=false.
+
+//         const systemPrompt = `You are a strict GUI action verifier.
+// You will be given:
+// - The user's target instruction (InstructionForUser)
+// - The intended action type (ActionType)
+// - The previous thought (ThoughtResponse)
+// - A screenshot where an overlay marks the intended action target/location.
+
+// Your job: Determine whether the overlay-marked target/location EXACTLY matches the intended target described by InstructionForUser/ThoughtResponse.
+// Only return Correctness=true if you are fully confident the overlay indicates the correct UI element with no deviation.
+
+// Return a structured response with:
+// - Think: your reasoning about whether it matches (be concise but concrete)
+// - Correctness: true/false`;
+
+//         const humanText = `InstructionForUser:\n${instructionForUser}\n\nActionType:\n${actionType}\n\nThoughtResponse:\n${thoughtResponse}`;
+
+//         const invokeOnce = async (method: "functionCalling" | "jsonMode") => {
+//           const llm = (verityModel as any).withStructuredOutput(VerityResponseSchema, { method });
+//           return await llm.invoke([
+//             new SystemMessage(systemPrompt),
+//             new HumanMessage({
+//               content: [
+//                 { type: "image_url", image_url: { url: `data:image/png;base64,${screenshotB64}` } },
+//                 { type: "text", text: humanText },
+//               ],
+//             } as any),
+//           ]);
+//         };
+
+//         let res: any;
+//         try {
+//           res = await invokeOnce("functionCalling");
+//         } catch (e: any) {
+//           console.warn("[verity] functionCalling failed, falling back to jsonMode.", e?.message ?? e);
+//           res = await invokeOnce("jsonMode");
+//         }
+
+//         const parsed = VerityResponseSchema.safeParse(res);
+
+//         if (!parsed.success) {
+//           // If parsing fails, be safe: treat as incorrect so we try to re-plan.
+//           console.warn("[verity] Failed to parse structured output, treating as incorrect.", parsed.error);
+//           return { verityThink: "", verityCorrectness: false };
+//         }
+//         console.log("[verity] parsed", parsed.data.Think);
+//         console.log("[verity] res", parsed.data.Correctness);
+
+//         return { verityThink: parsed.data.Think, verityCorrectness: parsed.data.Correctness };
+//       })
       .addNode("execute", async (state: PigletStateType) => {
         if (signal.aborted) throw new Error("Aborted");
         const exec = await this.executePlannedToolCall({
@@ -572,6 +651,21 @@ export class DualAgentService {
       .addEdge("call_action", "plan_overlay")
       .addEdge("build_executor_input", "plan_overlay")
       .addEdge("plan_overlay", "pre_capture")
+      // .addConditionalEdges(
+      //   "pre_capture",
+      //   (state: PigletStateType) => {
+      //     const at = state.actionType;
+      //     // Only verity-check actions that require target localization via overlay.
+      //     if (at && ["hotkey", "type", "finished", "wait"].includes(at)) return "execute";
+      //     return "verity";
+      //   },
+      //   ["execute", "verity"],
+      // )
+      // .addConditionalEdges(
+      //   "verity",
+      //   (state: PigletStateType) => (state.verityCorrectness ? "execute" : "build_action_prompt"),
+      //   ["execute", "build_action_prompt"],
+      // )
       .addEdge("pre_capture", "execute")
       .addEdge("execute", "post")
       .addConditionalEdges(
@@ -584,9 +678,9 @@ export class DualAgentService {
 
     // LangGraph 默认 recursionLimit=25（按“节点执行次数”计，不是按“轮数”计）
     // 我们每一轮会跑多个节点（capture/build/call/execute/post/sleep...），所以需要显式提高上限。
-    const estimatedNodesPerLoop = 12;
-    const maxSteps = 30;
-    const recursionLimit = Math.max(200, maxSteps * estimatedNodesPerLoop + 50);
+    const estimatedNodesPerLoop = 30; // added verity + conditional branches
+    const maxSteps = 60;
+    const recursionLimit = Math.max(400, maxSteps * estimatedNodesPerLoop + 100);
 
     await graph.invoke(
       {
@@ -654,7 +748,7 @@ export class DualAgentService {
     }
 
     // tutorial.py: if len(history) > 10, delete first 2 (excluding first SystemMessage)
-    if (history.length > 10) {
+    if (history.length > 15) {
       history = [history[0], ...history.slice(3)];
     }
 
@@ -673,26 +767,26 @@ export class DualAgentService {
 
   private async callAdvancedStructured(history: BaseMessage[]): Promise<ThoughtResponse> {
     if (!this.advancedModel) throw new Error("Advanced model not initialized");
-    // IMPORTANT:
-    // LangChain's ChatOpenAI.withStructuredOutput defaults to `jsonSchema` for non-OpenAI model names,
-    // which uses `response_format: { type: "json_schema" }`.
-    // Many OpenAI-compatible providers (incl. some SiliconFlow Qwen/Thinking routes) don't support this and may
-    // return a non-standard error body without `choices`, causing OpenAI SDK parseChatCompletion to crash.
-    // Force a more compatible method.
     const base = this.advancedModel as any;
-    const tryInvoke = async (method: "functionCalling" | "jsonMode") => {
-      const llm = base.withStructuredOutput(ThoughtResponseSchema, { method });
-      return await llm.invoke(history);
-    };
+    const llm = base.withStructuredOutput(ThoughtResponseSchema, { method: "functionCalling" });
 
+    // Bounded retry (no exponential backoff): try up to 3 times.
+    // We intentionally avoid jsonMode fallback here.
     let res: any;
-    try {
-      res = await tryInvoke("functionCalling");
-    } catch (e: any) {
-      // Fallback: some OpenAI-compatible providers/models don't support tool/function calling reliably.
-      // jsonMode is more widely compatible (response_format: json_object).
-      console.warn("[callAdvancedStructured] functionCalling failed, falling back to jsonMode.", e?.message ?? e);
-      res = await tryInvoke("jsonMode");
+    const maxAttempts = 3;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        res = await llm.invoke(history);
+        break;
+      } catch (e: any) {
+        if (attempt >= maxAttempts) throw e;
+        console.warn(
+          `[callAdvancedStructured] functionCalling failed (attempt ${attempt}/${maxAttempts}); retrying...`,
+          e?.message ?? e,
+        );
+        // Fixed delay to avoid tight-looping; no exponential backoff
+        await sleep(100);
+      }
     }
     // when withStructuredOutput is available, res is already an object; otherwise it is a message
     if (typeof res === "object" && res && "Thought" in res && "Instruction" in res && "ActionType" in res) {
