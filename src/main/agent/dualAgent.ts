@@ -28,6 +28,7 @@ import {
   runCommandInTerminalTTY,
   selfTestMouseMovement,
   sleep,
+  waitForScreenStability,
   type PendingScreenshotOverlay,
 } from './utils';
 import type { AppConfig } from '../store';
@@ -664,7 +665,7 @@ export class DualAgentService {
           } as any),
         ]);
 
-        console.log(res);
+        // console.log(res);
 
         const parsed = schema.safeParse(res);
         if (!parsed.success) {
@@ -728,7 +729,19 @@ export class DualAgentService {
       })
 
       .addNode("sleep", async () => {
-      await sleep(800, signal);
+      // After executing an action, continuously capture screenshots and wait until the screen is stable.
+      // Mirror `screendiff.py` logic: MSE -> causal EMA(alpha=0.3) -> log1p; stable when log <= 0.2 for >=0.5s.
+      // Give up after 5s and proceed anyway.
+      const waitResult = await waitForScreenStability({
+        signal,
+        fps: 20,
+        alpha: 0.5,
+        logThreshold: 1.0,
+        stableDurationMs: 200,
+        maxWaitMs: 2000,
+      });
+      console.log(waitResult);
+
         return {};
       })
       .addEdge(START, "capture")

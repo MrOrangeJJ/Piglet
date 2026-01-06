@@ -47,6 +47,106 @@ export const sleep = (ms: number, signal?: AbortSignal) =>
     }
   });
 
+/**
+ * Wait until the screen becomes "stable" after an action by continuously capturing screenshots and
+ * computing a causal EMA over frame-to-frame MSE, identical in logic to `screendiff.py`:
+ * - capture at fps (default 10)
+ * - grayscale + resize to 0.5x
+ * - mse between consecutive frames
+ * - causal EMA: y[n] = alpha*x[n] + (1-alpha)*y[n-1], alpha=0.3
+ * - stable when log1p(smoothed_mse) <= logThreshold (default 0.2) for >= stableDurationMs (default 500ms)
+ * - give up after maxWaitMs (default 5000ms)
+ */
+export async function waitForScreenStability(opts?: {
+  signal?: AbortSignal;
+  fps?: number;
+  alpha?: number;
+  logThreshold?: number;
+  stableDurationMs?: number;
+  maxWaitMs?: number;
+}): Promise<{ stable: boolean; elapsedMs: number; samples: number; lastLogSmoothed: number }> {
+  const {
+    signal,
+    fps = 10,
+    alpha = 0.3,
+    logThreshold = 0.2,
+    stableDurationMs = 500,
+    maxWaitMs = 5000,
+  } = opts ?? {};
+
+  if (signal?.aborted) throw new Error("Aborted");
+  const frameIntervalMs = 1000 / Math.max(1, fps);
+
+  let prevGray: Uint8Array | null = null;
+  let smoothed = 0;
+  let stableSince: number | null = null;
+  let samples = 0;
+
+  const tStart = Date.now();
+  let lastLogSmoothed = Number.POSITIVE_INFINITY;
+
+  while (true) {
+    if (signal?.aborted) throw new Error("Aborted");
+    const t0 = Date.now();
+
+    const buf = await screenshot({ format: "png" });
+    const img = await jimp.read(buf);
+
+    // screendiff.py: gray + resize (fx=0.5, fy=0.5)
+    const w = Math.max(1, Math.round(img.bitmap.width * 0.5));
+    const h = Math.max(1, Math.round(img.bitmap.height * 0.5));
+    img.resize(w, h);
+    img.greyscale();
+
+    const rgba = img.bitmap.data; // RGBA
+    const gray = new Uint8Array((rgba.length / 4) | 0);
+    for (let i = 0, j = 0; i < rgba.length; i += 4, j++) {
+      // after greyscale(), r=g=b -> take R channel
+      gray[j] = rgba[i]!;
+    }
+
+    let mse = 0;
+    if (prevGray) {
+      let err = 0;
+      const n = Math.min(gray.length, prevGray.length);
+      for (let i = 0; i < n; i++) {
+        const d = gray[i]! - prevGray[i]!;
+        err += d * d;
+      }
+      mse = err / n;
+    }
+
+    if (samples === 0) smoothed = mse;
+    else smoothed = alpha * mse + (1 - alpha) * smoothed;
+
+    lastLogSmoothed = Math.log1p(smoothed);
+    samples++;
+
+    const now = Date.now();
+
+    // stable window (>= 0.5s)
+    if (lastLogSmoothed <= logThreshold) {
+      if (stableSince == null) stableSince = now;
+      if (now - stableSince >= stableDurationMs) {
+        return { stable: true, elapsedMs: now - tStart, samples, lastLogSmoothed };
+      }
+    } else {
+      stableSince = null;
+    }
+
+    // overall timeout (>= 5s)
+    if (now - tStart >= maxWaitMs) {
+      return { stable: false, elapsedMs: now - tStart, samples, lastLogSmoothed };
+    }
+
+    prevGray = gray;
+
+    const spent = Date.now() - t0;
+    const toSleep = Math.max(0, frameIntervalMs - spent);
+    if (toSleep > 0) await sleep(toSleep, signal);
+  }
+}
+
 export const mapKey = (key: string): string => {
   const map: Record<string, string> = {
     return: "enter",

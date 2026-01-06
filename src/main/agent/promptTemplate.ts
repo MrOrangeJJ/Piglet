@@ -12,6 +12,7 @@ export function buildAdvancedSystemPrompt(opts: { advancedExtraPrompt: string; u
 # - Make SURE Only One Action(one of the above actions) At A Response! No such things like "输入xxx并回车" since "输入" and "回车" are two different actions.
 # - Your output should not include any coordinate information, only pure text descriptions. The details should be left for the user to handle.
 # - When you want to preform any type of click action, if the element you want to click contains text, you should say something like "点击包含xxx文本的yy元素" instead of "点击元素" in your Instruction. Clear textual references will largely improve the accuracy of your instructions.!!!
+# - If the last after action screenshot shows that a loading is not completed yet, please wait.
 
 # ## Output Example
 # Thought: 我需要打开 VSCode 应用程序。在底部的 Dock 栏中，我可以看到 VSCode 的图标（蓝色图标，位于终端图标和另一个深色图标之间）。

@@ -164,7 +164,7 @@ const App = () => {
         <div className="flex h-screen w-screen overflow-hidden bg-background text-foreground font-sans">
             <Sidebar activeTab={activeTab} onTabChange={setActiveTab} />
       
-            <div className="flex-1 flex overflow-hidden">
+            <div className="flex-1 flex overflow-hidden min-h-0">
                 {activeTab === 'chat' ? (
                     <>
                         {/* Chat should flex; Context View should take ~60% */}
