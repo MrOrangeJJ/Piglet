@@ -22,6 +22,7 @@ export function buildAdvancedSystemPrompt(opts: { advancedExtraPrompt: string; u
 # - Use ActionType: terminal_task ONLY when the next step(or next few steps) can be completed purely by Terminal commands (no visual UI interaction needed).
 # - In this case, Instruction should describe the terminal task goal clearly (what to achieve), not a GUI click instruction.
 # - If a step/muti-step can be completed purely by Terminal commands, you should use terminal_task action in highest priority.
+# - During a terminal_task, screenshots will not be see, so if your task requires screenshots, you should split it into muti terminal_task, so that you can see the result of the previous terminal_task.
 
 
 # ## Extra Prompt(This extra prompt is the suggestion from the previous experience, it is highly valuable for you to complete the task)
@@ -44,61 +45,60 @@ export function buildAdvancedFollowupPrompt(opts: { advancedExtraPrompt: string 
   return promptTemplate.replace("{}", advancedExtraPrompt || "");
 }
 
-export function buildActionPrompt(opts: { thought: string; extraPrompt?: string }) {
-  const { thought, extraPrompt } = opts;
-  // Keep EXACT content as dualAgent.ts (action prompt should not inject any rules)
-  return `You are a GUI agent. You are given a action instruction, with screenshots. You need to perform the next action(follow the instruction strictly dont think too much, do what the instruction ask you to do) to complete the task. 
+/**
+ * For coordinate-required actions (click/left_double/right_single/drag/scroll),
+ * ask the Action model to output ONLY the args JSON for the given actionType schema via structured output.
+ */
+export function buildCoordActionArgsPrompt(opts: {
+  actionType: string;
+  instructionForUser: string;
+}) {
+  const { actionType, instructionForUser } = opts;
+  return `You are a GUI coordinate localization assistant.
 
-## Output Format
-\`\`\`
-Action: ...
-\`\`\`
+You will be given:
+- A screenshot (the current screen, WITHOUT any overlay)
+- An ActionType
+- A short instruction describing what to interact with
 
-## Action Space
-
-click(start_box='<|box_start|>(x1, y1)<|box_end|>')
-left_double(start_box='<|box_start|>(x1, y1)<|box_end|>')
-right_single(start_box='<|box_start|>(x1, y1)<|box_end|>')
-drag(start_box='<|box_start|>(x1, y1)<|box_end|>', end_box='<|box_start|>(x3, y3)<|box_end|>')
-hotkey(key='')
-type(content='')
-scroll(start_box='<|box_start|>(x1, y1)<|box_end|>', direction='down or up or right or left')
-wait() #Sleep for 5s and take a screenshot to check for any changes.
-finished(content='xxx') # Use escape characters \\', \\", and \\n in content part to ensure we can parse the content in normal python string format.
-
-# ## Note
-# - Make SURE Only One Action At A Time!
-# - Even if the instructions contain two consecutive actions, you can only output one action at a time.
-# - For example, 'type(content='xxx') \nhotkey(key='enter')' is not allowed in one output, you should only output 'type(content='xxx')'instead.
-# - You must 100% follow the instruction strictly, if instructions tell you to press whichever keyboard shortcut you must do 100% the same.
-
-
-## Extra Prompt
-${extraPrompt}
-## User Instruction
-${thought}`;
-}
-
-export function buildExecutorSystemPrompt(opts: { instruction: string }) {
-  const { instruction } = opts;
-  // Mirror tutorial.py node_execute_action tool_prompt (核心约束一致 + 禁止擅自追加 \\n)
-  return `You are a tool-calling translator for a GUI automation system.
-
-You will be given a computer actioninstruction
-Your ONLY job: convert instruction into EXACTLY ONE tool call using the available tools.
+Your ONLY job: output a JSON object (args) that matches the schema for this ActionType.
 
 ## Strict rules
-- You MUST call exactly ONE tool.
-- Do NOT output any extra text besides the tool call.
+- Output JSON only (no extra text).
+- Coordinates MUST be in PIXELS of the provided screenshot (image space).
+- Do NOT guess wildly. If unsure, choose the most likely target described by the instruction.
+- For drag: choose start and end points accurately.
+- For scroll: choose a reasonable target point and direction. Do NOT output magnitude unless explicitly specified.
+
+## ActionType
+${actionType}
+
+## InstructionForUser
+${instructionForUser}`;
+}
+
+export function buildTextActionArgsSystemPrompt(opts: {
+  actionType: string;
+  instruction: string;
+}) {
+  const { actionType, instruction } = opts;
+  return `You are a parameter extractor for a GUI automation system.
+
+You will be given an action instruction and the intended ActionType.
+Your ONLY job: output a JSON object that matches the GIVEN schema for that ActionType.
+
+## Strict rules
+- You MUST output JSON only (no extra text).
 - Do NOT change the meaning of the instruction.
 - Preserve coordinates and parameters EXACTLY if they exist in the input.
 - Do NOT append "\\n" to typed content unless the instruction explicitly requires submission/pressing enter.
-- For scroll: use the tool's "magnitude" argument to control scroll amount (higher = scroll more). If not specified, keep default.
-- Even if the instructions contain two consecutive actions, you can only output one action at a time.
-- For example, if the instruction is "type 'xxx' and press enter", you should only call type tool and ignore the press enter part.
-- You must 100% follow the instruction strictly, if instructions tell you to press whichever keyboard shortcut you must do 100% the same.
+- For scroll: use "magnitude" to control scroll amount (higher = scroll more). If not specified, keep default.
+- Even if the instruction implies two actions, you MUST extract args for ONLY this single ActionType.
 
-## Inputs/Instruction:
+## ActionType
+${actionType}
+
+## Instruction
 ${instruction}`;
 }
 
@@ -113,6 +113,8 @@ You will be given a terminal task goal (in natural language). Your job is to com
 - If the task is complete, STOP calling tools and provide a concise final result summary in Chinese.
 - Prefer safe, read-only commands when possible. If a command can be destructive, double-check and avoid unless explicitly required by the task.
 - If a command fails, inspect the output and try a corrected command.
+- Make sure you dont fake any data in your final result summary, you must provide the exact data you see from the terminal.
+- If you realize that a task cannot be completed/or you tried many times but still cannot complete the task by terminal commands, you should just stop and claim that the task failed in your final result summary.
 `;
 }
 

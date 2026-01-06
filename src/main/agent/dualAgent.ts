@@ -5,21 +5,24 @@ import { MemoryVectorStore } from '@langchain/classic/vectorstores/memory';
 import { HumanMessage, SystemMessage, type BaseMessage, AIMessage } from '@langchain/core/messages';
 import { Annotation, StateGraph, START, END } from '@langchain/langgraph';
 import { createAgent, tool } from 'langchain';
-import * as z from 'zod';
 import {
-  buildActionPrompt,
+  ThoughtResponseSchema,
+  type ThoughtResponse,
+  TerminalRunSchema,
+  getExecutorActionSchema,
+} from './schema';
+import {
   buildAdvancedFollowupPrompt,
   buildAdvancedSystemPrompt,
-  buildExecutorSystemPrompt,
+  buildCoordActionArgsPrompt,
+  buildTextActionArgsSystemPrompt,
   buildTerminalHistoryPrompt,
   buildTerminalNodeSystemPrompt,
 } from './promptTemplate';
 import {
   captureScreenB64,
-  computePendingOverlayFromToolCall,
-  executeUiTarsAction,
-  escapeSingleQuotes,
-  getExecutorToolSchemaText,
+  computePendingOverlay,
+  executeUiTarsActionFromObj,
   resetRobotInputState,
   openTerminalWindowAndGetTTY,
   runCommandInTerminalTTY,
@@ -34,40 +37,9 @@ export interface TaskStartPayload {
   config: AppConfig;
 }
 
-// NOTE: helpers (sleep/mapKey/escapeSingleQuotes/screenshot/action exec) moved to ./utils
+// NOTE: helpers (sleep/mapKey/screenshot/action exec) moved to ./utils
 
-const ACTION_TYPES = [
-  "click",
-  "left_double",
-  "right_single",
-  "drag",
-  "hotkey",
-  "type",
-  "scroll",
-  "wait",
-  "finished",
-  "terminal_task",
-] as const;
-
-const ThoughtResponseSchema = z.object({
-  // 对齐 tutorial.py 的 Pydantic Field(description=...)
-  Thought: z.string().describe("what have you see in the screenshot and based on that, your thought on what should you do next to complete the task/why"),
-  Instruction: z.string().describe("clear and short instruction to the user, in chinese"),
-  // View: z.string(),
-  ActionType: z
-    .enum(ACTION_TYPES)
-    .describe(
-      "left_double is double click, right_single is right click!",
-    ),
-});
-
-type ThoughtResponse = z.infer<typeof ThoughtResponseSchema>;
-
-const VerityResponseSchema = z.object({
-  Think: z.string(),
-  Correctness: z.boolean(),
-});
-type VerityResponse = z.infer<typeof VerityResponseSchema>;
+// Zod schemas moved to ./schema.ts
 
 // LangGraph TS 的 Annotation 类型在复杂工程里容易触发 TS 推导/缓存问题。
 // 这里把 Annotation 相关类型降级为 any，避免阻塞开发；运行时逻辑不受影响。
@@ -88,22 +60,12 @@ const PigletState = Ann.Root({
   instructionForUser: Ann({ default: () => undefined }),
   actionType: Ann({ default: () => undefined }),
 
-  actionPrompt: Ann({ default: () => undefined }),
-  actionResponseText: Ann({ default: () => undefined }),
-  actionLine: Ann({ default: () => undefined }),
-
-  finalInstructionForExecutor: Ann({ default: () => undefined }),
-  finished: Ann({ default: () => undefined }),
-
   // Executor planned tool call (computed before executing)
   plannedToolName: Ann({ default: () => undefined }),
   plannedToolArgs: Ann({ default: () => undefined }),
   plannedToolDisplayText: Ann({ default: () => undefined }),
 
-  verityThink: Ann({ default: () => undefined }),
-  verityCorrectness: Ann({ default: () => undefined }),
-
-  terminalTaskResultText: Ann({ default: () => undefined }),
+  terminalActionResultText: Ann({ default: () => undefined }),
 });
 
 type PigletStateType = any;
@@ -117,11 +79,9 @@ type AdvancedRuleExample = {
 
 export class DualAgentService {
   private advancedModel: ChatOpenAI | null = null;
-  private actionModel: ChatOpenAI | null = null;
-  private executorModel: ChatOpenAI | null = null;
+  private coordActionModel: ChatOpenAI | null = null;
+  private textActionModel: ChatOpenAI | null = null;
   private advancedHistory: BaseMessage[] = [];
-  // Keep last task's advanced history snapshot for export (until next task starts)
-  private lastFinishedAdvancedHistory: BaseMessage[] = [];
   private mainWindow: BrowserWindow;
   private overlayWindow: BrowserWindow;
   // LangChain 原生机制：语意相似规则选择器（只用于 Advanced rules 动态注入）
@@ -133,9 +93,6 @@ export class DualAgentService {
   // Current Configuration
   private currentConfig: AppConfig | null = null;
   
-  // Track repetitive actions
-  private lastActionResponse: string = '';
-  private repeatActionCount: number = 0;
 
   // Overlay annotation to be drawn into NEXT screenshot sent to LLM
   private pendingScreenshotOverlay: PendingScreenshotOverlay = null;
@@ -155,7 +112,7 @@ export class DualAgentService {
 
   /** JSON-serializable export payload for Advanced history (prefers last finished snapshot). */
   getAdvancedHistoryExportObject() {
-    const msgs = (this.lastFinishedAdvancedHistory?.length ? this.lastFinishedAdvancedHistory : this.advancedHistory) as any[];
+    const msgs = this.advancedHistory as any[];
     const stored = (msgs || []).map((m: any) => {
       // LangChain BaseMessage supports toDict() (StoredMessage) + toJSON() (Serializable)
       if (m && typeof m.toDict === "function") return m.toDict();
@@ -301,6 +258,60 @@ export class DualAgentService {
     }
   }
 
+  /**
+   * 动态裁剪 Advanced history（在调用 advanced model 之前统一处理）。
+   *
+   * index 定义：倒序 index（0 => 最后一条，1 => 倒数第二条 ...）
+   *
+   * 规则：
+   * - 永远保留最开始的 SystemMessage（如果存在）作为最早的 msg
+   * - index 0..5：保留完整对话（不删除）
+   * - index > 5：删除所有 HumanMessage
+   * - 在 index=6 位置插入一个 HumanMessage(content="...Previous human response omitted ")（插入，不替换）
+   * - 处理后将 index > 10 的部分都切掉（保留最后 11 条；再加上最开始 SystemMessage）
+   */
+  private trimAdvancedHistoryForInvoke(history: BaseMessage[]): BaseMessage[] {
+    const msgs = Array.isArray(history) ? [...history] : [];
+    if (!msgs.length) return msgs;
+
+    const first = msgs[0];
+    const hasSystem = first && (first as any)._getType?.() === "system";
+    const systemMsg = hasSystem ? (first as any as BaseMessage) : null;
+    const rest = hasSystem ? msgs.slice(1) : msgs;
+
+    // 保留最后 6 条（index 0..5）
+    const keepLast = 6;
+    const tail = rest.length > keepLast ? rest.slice(-keepLast) : [...rest];
+    const older = rest.length > keepLast ? rest.slice(0, -keepLast) : [];
+
+    // index > 5 的部分：删除所有 HumanMessage
+    let removedAnyHuman = false;
+    const olderNoHuman = older.filter((m) => {
+      const t = (m as any)?._getType?.() ?? (m as any)?.type;
+      const isHuman = t === "human";
+      if (isHuman) removedAnyHuman = true;
+      return !isHuman;
+    }) as BaseMessage[];
+
+    // Insert omission marker at reverse index=6 (right before the last 6 messages),
+    // because this is exactly where we start deleting HumanMessage from older parts.
+    let combinedNoMarker: BaseMessage[] = [...olderNoHuman, ...tail];
+    const hadMoreThanWindow = combinedNoMarker.length > 11;
+    const needMarker = removedAnyHuman || hadMoreThanWindow;
+
+    let combined: BaseMessage[] = [...olderNoHuman];
+    if (needMarker && rest.length > keepLast) {
+      // Insert (do NOT replace)
+      combined.push(new HumanMessage("...Previous human response omitted "));
+    }
+    combined.push(...tail);
+
+    // After processing, keep only reverse index 0..10 (last 11 messages)
+    // if (combined.length > 11) combined = combined.slice(-11);
+
+    return systemMsg ? [systemMsg, ...combined] : combined;
+  }
+
   async startTask(instruction: string, config: AppConfig) {
     // Cancel previous task if running
     if (this.abortController) {
@@ -312,10 +323,8 @@ export class DualAgentService {
 
     this.currentConfig = config;
     this.advancedHistory = [];
-    // New task starts: clear last finished snapshot (export is for previous task)
-    this.lastFinishedAdvancedHistory = [];
-    this.lastActionResponse = '';
-    this.repeatActionCount = 0;
+
+    // (coord actions now return structured args; no need to track repeated raw "Action:" lines)
     
     // Initialize LangChain models with new config
     try {
@@ -323,24 +332,24 @@ export class DualAgentService {
             model: config.advancedModel.modelName,
             apiKey: config.advancedModel.apiKey,
             configuration: { baseURL: config.advancedModel.baseUrl },
-            temperature: 0,
+            // temperature: 0,
             // We implement our own bounded retry for advanced structured output.
             // Disable internal exponential backoff retries to avoid long stalls on flaky providers.
-            maxRetries: 0,
+            maxRetries: 5,
         });
         
-        this.actionModel = new ChatOpenAI({
-            model: config.actionModel.modelName,
-            apiKey: config.actionModel.apiKey,
-            configuration: { baseURL: config.actionModel.baseUrl },
-            temperature: 0,
+        // coordActionModel: responsible for coordinate localization (image -> schema args)
+        this.coordActionModel = new ChatOpenAI({
+          model: config.actionModel.modelName,
+          apiKey: config.actionModel.apiKey,
+          configuration: { baseURL: config.actionModel.baseUrl },
         });
 
-        this.executorModel = new ChatOpenAI({
-            model: config.executorModel.modelName,
-            apiKey: config.executorModel.apiKey,
-            configuration: { baseURL: config.executorModel.baseUrl },
-            temperature: 0,
+        // textActionModel: responsible for text-only actions (instruction -> schema args)
+        this.textActionModel = new ChatOpenAI({
+          model: config.executorModel.modelName,
+          apiKey: config.executorModel.apiKey,
+          configuration: { baseURL: config.executorModel.baseUrl },
         });
 
         // Build advanced rules selector using LangChain's official mechanism:
@@ -425,12 +434,7 @@ export class DualAgentService {
         this.abortController.abort();
         this.abortController = null;
     }
-    // Snapshot current advanced history for export even if user stops mid-run.
-    try {
-      this.lastFinishedAdvancedHistory = [...(this.advancedHistory || [])];
-    } catch {
-      this.lastFinishedAdvancedHistory = [];
-    }
+ 
     // If aborted mid-action, robotjs might leave the OS in a stuck input state (mouse down / modifier down).
     // This can cause the UI to require "double clicks" after stopping from the overlay.
     resetRobotInputState();
@@ -444,7 +448,7 @@ export class DualAgentService {
 
   private async runLoop(instruction: string, signal: AbortSignal) {
     if (!this.currentConfig) throw new Error("Config not initialized");
-    if (!this.advancedModel || !this.actionModel || !this.executorModel) {
+    if (!this.advancedModel || !this.coordActionModel || !this.textActionModel) {
       throw new Error("LangChain models not initialized");
     }
 
@@ -476,20 +480,20 @@ export class DualAgentService {
           scaleFactor,
         };
       })
-      .addNode("build_thought_prompt", async (state: PigletStateType) => {
+      .addNode("manage_computer_use_history", async (state: PigletStateType) => {
         if (signal.aborted) throw new Error("Aborted");
         const step = state.step || 0;
         const queryForRules = step <= 0 ? state.userQuery : (state.thoughtResponse || "");
         const advancedExtraPrompt = await this.selectAdvancedRulesPrompt(queryForRules);
 
-        // Rehydrate advanced history from state, then build new history for this turn
-        this.advancedHistory = (state.advancedHistory || []) as any;
-        const history = this.buildThoughtHistoryForThisTurn({
+        const history = this.buildComputerUseHistoryForThisTurn({
           step,
           screenshotBase64: state.screenshotB64 || "",
           rawScreenshotBase64: state.rawScreenshotB64 || "",
           userQuery: state.userQuery,
+          pass_history: state.advancedHistory,
           advancedExtraPrompt,
+          
         });
 
         return { advancedHistory: history };
@@ -497,13 +501,14 @@ export class DualAgentService {
       .addNode("call_advanced", async (state: PigletStateType) => {
         if (signal.aborted) throw new Error("Aborted");
         const history = (state.advancedHistory || []) as any as BaseMessage[];
-        const res = await this.callAdvancedStructured(history);
+        const trimmedHistory = this.trimAdvancedHistoryForInvoke(history);
+        // this.advancedHistory = [...trimmedHistory];
+        const res = await this.callAdvancedStructured(trimmedHistory);
 
         let instr = (res.Instruction || "").toString();
 
         // tutorial.py: push AIMessage(content=Thought) into history
         const updatedHistory = [...history, new AIMessage(`Thought: ${res.Thought}\nInstruction: ${instr}\nActionType: ${res.ActionType}`)];
-
         // Fix: type action should NOT accidentally add trailing \\n (unless explicitly asked)
 
         const thoughtDisplay =
@@ -515,24 +520,27 @@ export class DualAgentService {
         this.sendToMain("agent-thought", { text: thoughtDisplay });
         this.sendToMain("agent-image", { image: imageSrc });
 
+        this.advancedHistory = updatedHistory;
+
         return {
           thoughtResponse: res.Thought,
           instructionForUser: instr,
           actionType: res.ActionType,
           advancedHistory: updatedHistory,
+          step: (state.step || 0) + 1,
         };
       })
-      .addNode("terminal_node", async (state: PigletStateType) => {
+      .addNode("call_terminal_action", async (state: PigletStateType) => {
         if (signal.aborted) throw new Error("Aborted");
         if (!this.advancedModel) throw new Error("Advanced model not initialized");
 
-        // Per requirement: entering terminal_node creates a NEW Terminal window/tab once,
-        // and all tool calls within this terminal_node reuse the SAME tab via tty.
+        // Per requirement: entering call_terminal_action creates a NEW Terminal window/tab once,
+        // and all tool calls within this node reuse the SAME tab via tty.
         let tty = await openTerminalWindowAndGetTTY({ signal, timeoutMs: 20_000 });
 
         const terminal_run: any = tool(
           async ({ command }: { command: string }) => {
-            // Always reuse the same tty inside this terminal_node.
+            // Always reuse the same tty inside this call_terminal_action.
             // If user closes the tab/window, we auto-recreate a new session tty and retry once.
             const runOnce = async () =>
               await runCommandInTerminalTTY({
@@ -571,7 +579,7 @@ export class DualAgentService {
             name: "terminal_run",
             description:
               "Run ONE shell command in visible macOS Terminal.app, capture its full output (stdout+stderr) and exit code.",
-            schema: z.object({ command: z.string().min(1) }) as any,
+            schema: TerminalRunSchema as any,
           },
         ) as any;
 
@@ -611,171 +619,101 @@ export class DualAgentService {
           (finalSummary ? `Terminal 任务结果总结：\n${finalSummary}\n\n` : "") +
           (toolOutputs.length ? `Terminal 详细输出：\n\n${toolOutputs.join("\n\n---\n\n")}` : "");
 
-        return { terminalTaskResultText: merged || (finalSummary || "Terminal 执行结束（无输出）。") };
+        return { terminalActionResultText: merged || (finalSummary || "Terminal 执行结束（无输出）。") };
       })
-      .addNode("terminal_history_node", async (state: PigletStateType) => {
+      .addNode("manage_terminal_use_history", async (state: PigletStateType) => {
         if (signal.aborted) throw new Error("Aborted");
-        const terminalResultText = (state.terminalTaskResultText || "").toString();
-
-        // Rehydrate advanced history from state, then append a terminal-result turn
-        this.advancedHistory = (state.advancedHistory || []) as any;
-        const history = [...this.advancedHistory];
-
-        // Capture a fresh screenshot for context (optional but helps when switching back to GUI steps)
-        const { base64WithOverlay, base64Raw, width, height, scaleFactor } = await captureScreenB64({
-          pendingOverlay: null,
-        });
+        const terminalResultText = (state.terminalActionResultText || "").toString();
+        const base64Raw = String(state.rawScreenshotB64 || "");
 
         const promptText = buildTerminalHistoryPrompt({ terminalResultText });
         const msg = new HumanMessage({
           content: [
-            // { type: "image_url", image_url: { url: `data:image/png;base64,${base64WithOverlay}` } },
-            { type: "image_url", image_url: { url: `data:image/png;base64,${base64Raw}` } },
+            ...(base64Raw
+              ? [{ type: "image_url", image_url: { url: `data:image/png;base64,${base64Raw}` } }]
+              : []),
             { type: "text", text: promptText },
           ],
         } as any);
 
         // Context image stream
-        this.sendToMain("agent-image", { image: `data:image/png;base64,${base64Raw}` });
+        if (base64Raw) this.sendToMain("agent-image", { image: `data:image/png;base64,${base64Raw}` });
 
-        const nextHistory = [...history, msg];
-        return {
-          // This node "manages prompt" for the next advanced call (do not go build_thought_prompt)
-          advancedHistory: nextHistory,
-          rawScreenshotB64: base64Raw,
-          screenshotB64: base64WithOverlay,
-          modelW: width,
-          modelH: height,
-          scaleFactor,
-          step: (state.step || 0) + 1,
-        };
+        const nextHistory = [...(state.advancedHistory || []), msg];
+        return { advancedHistory: nextHistory };
       })
-      .addNode("build_action_prompt", async (state: PigletStateType) => {
-        return { actionPrompt: buildActionPrompt({ thought: state.instructionForUser || "", extraPrompt: "" }) };
-      })
-      .addNode("call_action", async (state: PigletStateType) => {
+      .addNode("call_coord_action", async (state: PigletStateType) => {
         if (signal.aborted) throw new Error("Aborted");
-        // Action 模型看到的截图：不带 overlay
-        const base64ForActionModel = state.rawScreenshotB64 || state.screenshotB64 || "";
-        const prompt = state.actionPrompt || "";
-        const text = await this.callActionV2(base64ForActionModel, prompt);
+        if (!this.coordActionModel) throw new Error("Coord action model not initialized");
+        const actionType = String(state.actionType || "");
+        const schema = getExecutorActionSchema(actionType);
+        if (!schema) throw new Error(`No action args schema for actionType: ${actionType}`);
 
-        const actionLine = text.match(/Action:\s*(.*)/)?.[1] || "";
-        if (actionLine === this.lastActionResponse) {
-          this.repeatActionCount++;
-      } else {
-          this.repeatActionCount = 1;
-          this.lastActionResponse = actionLine;
+        // Action model sees RAW screenshot only (no overlay)
+        const base64ForActionModel = state.rawScreenshotB64 || state.screenshotB64 || "";
+        const prompt = buildCoordActionArgsPrompt({
+          actionType,
+          instructionForUser: String(state.instructionForUser || ""),
+        });
+
+        const llm = (this.coordActionModel as any).withStructuredOutput(schema, { method: "jsonSchema" });
+        const res = await llm.invoke([
+          new SystemMessage(prompt),
+          new HumanMessage({
+            content: [{ type: "image_url", image_url: { url: `data:image/png;base64,${base64ForActionModel}` } }],
+          } as any),
+        ]);
+
+        console.log(res);
+
+        const parsed = schema.safeParse(res);
+        if (!parsed.success) {
+          throw new Error(`Action model structured output parse failed for ${actionType}: ${parsed.error}`);
         }
+        const args = parsed.data;
+        const displayText =
+          `Action Args (from Action Model):\n` +
+          `- actionType: ${actionType}\n` +
+          `- args: ${JSON.stringify(args ?? {}, null, 2)}`;
 
         return {
-          actionResponseText: text,
-          actionLine,
-          finalInstructionForExecutor: `Instruction: ${state.instructionForUser || ""}\nAction: ${actionLine}`,
+          plannedToolName: actionType,
+          plannedToolArgs: args,
+          plannedToolDisplayText: displayText,
         };
       })
-      .addNode("build_executor_input", async (state: PigletStateType) => {
-        const actionType = state.actionType || "click";
+      .addNode("call_text_action", async (state: PigletStateType) => {
+        if (signal.aborted) throw new Error("Aborted");
+        const actionType = String(state.actionType || "");
+        const planned = await this.prepareTextActionArgs({
+          actionType,
+          instruction: String(state.instructionForUser || ""),
+          signal,
+        });
         return {
-          finalInstructionForExecutor: `Instruction: ${state.instructionForUser || ""}\nActionType: ${actionType}`,
+          plannedToolName: planned.actionType, // reuse existing state keys
+          plannedToolArgs: planned.args,
+          plannedToolDisplayText: planned.displayText,
         };
       })
       .addNode("plan_overlay", async (state: PigletStateType) => {
         if (signal.aborted) throw new Error("Aborted");
-        const planned = await this.prepareExecutorToolCall({
-          instruction: state.finalInstructionForExecutor || "",
-          modelImageWidth: state.modelW || 0,
-          modelImageHeight: state.modelH || 0,
-          scaleFactor: state.scaleFactor || 1,
-          signal,
-        });
-
-        const pending = computePendingOverlayFromToolCall({
-          toolName: planned.toolName,
-          args: planned.toolArgs,
+        const actionType = String(state.plannedToolName || state.actionType || "");
+        const args = (state.plannedToolArgs ?? {}) as any;
+        const pending = computePendingOverlay({
+          actionType,
+          args,
           modelImageWidth: state.modelW || 0,
           modelImageHeight: state.modelH || 0,
         });
         if (pending) this.pendingScreenshotOverlay = pending;
-
-        return {
-          plannedToolName: planned.toolName,
-          plannedToolArgs: planned.toolArgs,
-          plannedToolDisplayText: planned.displayText,
-        };
+        return {};
       })
-//       .addNode("verity", async (state: PigletStateType) => {
-//         if (signal.aborted) throw new Error("Aborted");
-//         if (!this.currentConfig) throw new Error("Config not initialized");
-
-//         const screenshotB64 = state.screenshotB64 || "";
-//         const instructionForUser = (state.instructionForUser || "").toString();
-//         const actionType = (state.actionType || "").toString();
-//         const thoughtResponse = (state.thoughtResponse || "").toString();
-
-//         // NOTE: verity is a single-shot check (no history). Reuse advanced model settings, but create a fresh client.
-//         const verityModel = new ChatOpenAI({
-//           model: this.currentConfig.advancedModel.modelName,
-//           apiKey: this.currentConfig.advancedModel.apiKey,
-//           configuration: { baseURL: this.currentConfig.advancedModel.baseUrl },
-//           temperature: 0,
-//         });
-// // Be extremely strict: if there is ANY ambiguity, any off-by-a-bit, or it might click the wrong element, return Correctness=false.
-
-//         const systemPrompt = `You are a strict GUI action verifier.
-// You will be given:
-// - The user's target instruction (InstructionForUser)
-// - The intended action type (ActionType)
-// - The previous thought (ThoughtResponse)
-// - A screenshot where an overlay marks the intended action target/location.
-
-// Your job: Determine whether the overlay-marked target/location EXACTLY matches the intended target described by InstructionForUser/ThoughtResponse.
-// Only return Correctness=true if you are fully confident the overlay indicates the correct UI element with no deviation.
-
-// Return a structured response with:
-// - Think: your reasoning about whether it matches (be concise but concrete)
-// - Correctness: true/false`;
-
-//         const humanText = `InstructionForUser:\n${instructionForUser}\n\nActionType:\n${actionType}\n\nThoughtResponse:\n${thoughtResponse}`;
-
-//         const invokeOnce = async (method: "functionCalling" | "jsonMode") => {
-//           const llm = (verityModel as any).withStructuredOutput(VerityResponseSchema, { method });
-//           return await llm.invoke([
-//             new SystemMessage(systemPrompt),
-//             new HumanMessage({
-//               content: [
-//                 { type: "image_url", image_url: { url: `data:image/png;base64,${screenshotB64}` } },
-//                 { type: "text", text: humanText },
-//               ],
-//             } as any),
-//           ]);
-//         };
-
-//         let res: any;
-//         try {
-//           res = await invokeOnce("functionCalling");
-//         } catch (e: any) {
-//           console.warn("[verity] functionCalling failed, falling back to jsonMode.", e?.message ?? e);
-//           res = await invokeOnce("jsonMode");
-//         }
-
-//         const parsed = VerityResponseSchema.safeParse(res);
-
-//         if (!parsed.success) {
-//           // If parsing fails, be safe: treat as incorrect so we try to re-plan.
-//           console.warn("[verity] Failed to parse structured output, treating as incorrect.", parsed.error);
-//           return { verityThink: "", verityCorrectness: false };
-//         }
-//         console.log("[verity] parsed", parsed.data.Think);
-//         console.log("[verity] res", parsed.data.Correctness);
-
-//         return { verityThink: parsed.data.Think, verityCorrectness: parsed.data.Correctness };
-//       })
       .addNode("execute", async (state: PigletStateType) => {
         if (signal.aborted) throw new Error("Aborted");
-        const exec = await this.executePlannedToolCall({
-          toolName: state.plannedToolName,
-          toolArgs: state.plannedToolArgs,
+        await this.executePlannedAction({
+          actionType: state.plannedToolName,
+          args: state.plannedToolArgs,
           modelImageWidth: state.modelW || 0,
           modelImageHeight: state.modelH || 0,
           scaleFactor: state.scaleFactor || 1,
@@ -786,80 +724,50 @@ export class DualAgentService {
         // Text-only event. Images are streamed via `agent-image`.
         this.sendToMain("agent-action-plan", { text: state.plannedToolDisplayText || "" });
         this.sendToMain("agent-image", { image: imageSrc });
-
-        const at = state.actionType;
-        const alsoFinished =
-          exec.finished ||
-          (state.actionLine || "").includes("finished") ||
-          at === "finished";
-
-        return { finished: alsoFinished };
+        return {};
       })
-      .addNode("post", async (state: PigletStateType) => {
-        // IMPORTANT: when task is finished (Action: finished), notify renderer to flip UI state back.
-        if (state.finished) {
-          // Snapshot advanced history for export (persist until next task starts)
-          try {
-            this.lastFinishedAdvancedHistory = [...((state.advancedHistory || this.advancedHistory) as any[])];
-          } catch {
-            this.lastFinishedAdvancedHistory = [...(this.advancedHistory || [])];
-          }
-          this.sendToMain("task-finished");
-          return { finished: true };
-        }
-        return { step: (state.step || 0) + 1 };
-      })
+
       .addNode("sleep", async () => {
       await sleep(800, signal);
         return {};
       })
       .addEdge(START, "capture")
-      .addEdge("capture", "build_thought_prompt")
-      .addEdge("build_thought_prompt", "call_advanced")
+      .addConditionalEdges(
+        "capture",
+        (state: PigletStateType) => {
+          // After a terminal action we go manage_terminal_use_history, otherwise manage_computer_use_history.
+          return state.actionType === "terminal_task"
+            ? "manage_terminal_use_history"
+            : "manage_computer_use_history";
+        },
+        ["manage_terminal_use_history", "manage_computer_use_history"],
+      )
+      .addEdge("manage_computer_use_history", "call_advanced")
+      .addEdge("manage_terminal_use_history", "call_advanced")
       .addConditionalEdges(
         "call_advanced",
         (state: PigletStateType) => {
           const at = state.actionType;
-          if (at === "terminal_task") return "terminal_node";
-          if (at && ["hotkey", "type", "finished", "wait"].includes(at)) return "build_executor_input";
-          return "build_action_prompt";
+          if (at === "terminal_task") return "call_terminal_action";
+          if (at === "finished"){
+            this.sendToMain("task-finished");
+            return END;
+          }
+          if (at && ["hotkey", "type", "wait"].includes(at)) return "call_text_action";
+          return "call_coord_action";
         },
-        ["terminal_node", "build_executor_input", "build_action_prompt"],
+        ["call_terminal_action", "call_text_action", "call_coord_action", END],
       )
-      .addEdge("terminal_node", "terminal_history_node")
-      .addEdge("terminal_history_node", "call_advanced")
-      .addEdge("build_action_prompt", "call_action")
-      .addEdge("call_action", "plan_overlay")
-      .addEdge("build_executor_input", "plan_overlay")
+      .addEdge("call_terminal_action", "capture")
+      .addEdge("call_coord_action", "plan_overlay")
+      .addEdge("call_text_action", "plan_overlay")
       .addEdge("plan_overlay", "pre_capture")
-      // .addConditionalEdges(
-      //   "pre_capture",
-      //   (state: PigletStateType) => {
-      //     const at = state.actionType;
-      //     // Only verity-check actions that require target localization via overlay.
-      //     if (at && ["hotkey", "type", "finished", "wait"].includes(at)) return "execute";
-      //     return "verity";
-      //   },
-      //   ["execute", "verity"],
-      // )
-      // .addConditionalEdges(
-      //   "verity",
-      //   (state: PigletStateType) => (state.verityCorrectness ? "execute" : "build_action_prompt"),
-      //   ["execute", "build_action_prompt"],
-      // )
       .addEdge("pre_capture", "execute")
-      .addEdge("execute", "post")
-      .addConditionalEdges(
-        "post",
-        (state: PigletStateType) => (state.finished ? END : "sleep"),
-        [END, "sleep"],
-      )
+      .addEdge("execute", "sleep")
       .addEdge("sleep", "capture")
       .compile();
 
-    // LangGraph 默认 recursionLimit=25（按“节点执行次数”计，不是按“轮数”计）
-    // 我们每一轮会跑多个节点（capture/build/call/execute/post/sleep...），所以需要显式提高上限。
-    const estimatedNodesPerLoop = 30; // added verity + conditional branches
+    const estimatedNodesPerLoop = 24; // terminal + coord/text + overlay + capture + pre_capture + execute + sleep...
     const maxSteps = 60;
     const recursionLimit = Math.max(400, maxSteps * estimatedNodesPerLoop + 100);
 
@@ -906,31 +814,29 @@ export class DualAgentService {
     return dedup.join("\n\n");
   }
 
-  private buildThoughtHistoryForThisTurn(opts: {
+  private buildComputerUseHistoryForThisTurn(opts: {
     step: number;
     screenshotBase64: string;
     rawScreenshotBase64: string;
     userQuery: string;
     advancedExtraPrompt: string;
+    pass_history: BaseMessage[];
   }): BaseMessage[] {
-    const { step, screenshotBase64, rawScreenshotBase64, userQuery, advancedExtraPrompt } = opts;
+    const { step, screenshotBase64, rawScreenshotBase64, userQuery, advancedExtraPrompt, pass_history } = opts;
 
-    let history = [...this.advancedHistory];
+    let history = [...pass_history];
 
     if (step <= 0) {
       const systemPrompt = buildAdvancedSystemPrompt({ advancedExtraPrompt, userQuery });
 
-      history = [new SystemMessage(systemPrompt)];
+      history = [...this.advancedHistory, new SystemMessage(systemPrompt)];
 
       const msg = new HumanMessage({
         content: [{ type: "image_url", image_url: { url: `data:image/png;base64,${rawScreenshotBase64}` } }],
       } as any);
-      return [...history, msg];
-    }
 
-    // tutorial.py: if len(history) > 10, delete first 2 (excluding first SystemMessage)
-    if (history.length > 15) {
-      history = [history[0], ...history.slice(3)];
+
+      return [...history, msg];
     }
 
     const prompt = buildAdvancedFollowupPrompt({ advancedExtraPrompt });
@@ -943,6 +849,7 @@ export class DualAgentService {
       ],
     } as any);
 
+
     return [...history, msg];
   }
 
@@ -950,25 +857,12 @@ export class DualAgentService {
     if (!this.advancedModel) throw new Error("Advanced model not initialized");
     const base = this.advancedModel as any;
     const llm = base.withStructuredOutput(ThoughtResponseSchema, { method: "functionCalling" });
+    // const llm = base.withStructuredOutput(ThoughtResponseSchema, { method: "jsonMode" });
 
-    // Bounded retry (no exponential backoff): try up to 3 times.
-    // We intentionally avoid jsonMode fallback here.
+
     let res: any;
-    const maxAttempts = 3;
-    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-      try {
-        res = await llm.invoke(history);
-        break;
-      } catch (e: any) {
-        if (attempt >= maxAttempts) throw e;
-        console.warn(
-          `[callAdvancedStructured] functionCalling failed (attempt ${attempt}/${maxAttempts}); retrying...`,
-          e?.message ?? e,
-        );
-        // Fixed delay to avoid tight-looping; no exponential backoff
-        await sleep(100);
-      }
-    }
+    res = await llm.invoke(history);
+
     // when withStructuredOutput is available, res is already an object; otherwise it is a message
     if (typeof res === "object" && res && "Thought" in res && "Instruction" in res && "ActionType" in res) {
       return res as ThoughtResponse;
@@ -982,258 +876,62 @@ export class DualAgentService {
     }
   }
 
-  private async callActionV2(base64Image: string, prompt: string) {
-    if (!this.actionModel) throw new Error("Action model not initialized");
-    const msg = new HumanMessage({
-      content: [
-        { type: "image_url", image_url: { url: `data:image/png;base64,${base64Image}` } },
-        { type: "text", text: prompt },
-      ],
-    } as any);
-    
-    const maxAttempts = 2;
-    let last = "";
-    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-      const ai = await this.actionModel.invoke([msg]);
-      last = ((ai.content as any) || "").toString();
-      if (last.includes("Action:")) return last;
-      console.warn(`[ActionModel] Missing "Action:" in response (attempt ${attempt}/${maxAttempts}). Retrying once...`, last);
-    }
-    return last;
-  }
-
-  private async prepareExecutorToolCall(opts: {
+  private async prepareTextActionArgs(opts: {
+    actionType: string;
     instruction: string;
-    modelImageWidth: number;
-    modelImageHeight: number;
-    scaleFactor: number;
     signal: AbortSignal;
-  }): Promise<{ toolName: string; toolArgs: any; displayText: string }> {
-    if (!this.executorModel) throw new Error("Executor model not initialized");
-    const { instruction, modelImageWidth, modelImageHeight, scaleFactor, signal } = opts;
+  }): Promise<{ actionType: string; args: any; displayText: string }> {
+    // Text-only action arg extraction
+    if (!this.textActionModel) throw new Error("Text action model not initialized");
+    const { actionType, instruction, signal } = opts;
+    if (signal.aborted) throw new Error("Aborted");
 
-    // NOTE: LangChain tool typings can get extremely deep in TS; keep runtime behavior but erase types.
-    const toolsByName = this.buildExecutorTools({
-      modelImageWidth,
-      modelImageHeight,
-      scaleFactor,
-      signal,
-    }) as Record<string, any>;
-    const tools = Object.values(toolsByName) as any[];
-    const modelWithTools = (this.executorModel as any).bindTools
-      ? (this.executorModel as any).bindTools(tools as any)
-      : this.executorModel;
+    const schema = getExecutorActionSchema(actionType);
+    if (!schema) throw new Error(`No executor args schema for actionType: ${actionType}`);
 
-    const systemPrompt = buildExecutorSystemPrompt({ instruction });
-    const ai = await modelWithTools.invoke([
-      new SystemMessage(systemPrompt),
-      new HumanMessage("Convert action_text into exactly one tool call(make sure match the action type). You will see something in this format '(start_box='<|box_start|>(x,y)<|box_end|>'), please follow the coordinate strictly, first is x , second is y ."),
-    ]);
 
-    const toolCalls =
-      (ai as any).tool_calls ||
-      (ai as any).additional_kwargs?.tool_calls ||
-      (ai as any).additional_kwargs?.toolCalls ||
-      [];
+    const systemPrompt = buildTextActionArgsSystemPrompt({
+      actionType,
+      instruction,
+    });
 
-    if (!toolCalls.length) {
-      throw new Error("Executor model did not call any tool.");
+    const base = this.textActionModel as any;
+    const llm = base.withStructuredOutput(schema, { method: "functionCalling" });
+    const res = await llm.invoke([new SystemMessage(systemPrompt)]);
+    const parsed = schema.safeParse(res);
+    if (!parsed.success) {
+      throw new Error(`Executor structured output parse failed for ${actionType}: ${parsed.error}`);
     }
-
-    const call = toolCalls[0];
-    const name = call.name;
-    const args = call.args ?? call.arguments ?? {};
-    const schema = getExecutorToolSchemaText(String(name || ""));
+    const args = parsed.data;
     const displayText =
-      `Tool Call:\n` +
-      `- name: ${String(name || "")}\n` +
+      `Action Args:\n` +
+      `- actionType: ${String(actionType || "")}\n` +
       `- args: ${JSON.stringify(args ?? {}, null, 2)}`;
 
-    return { toolName: String(name || ""), toolArgs: args, displayText };
+    return { actionType, args, displayText };
   }
 
-  private async executePlannedToolCall(opts: {
-    toolName: string;
-    toolArgs: any;
+  private async executePlannedAction(opts: {
+    actionType: string;
+    args: any;
     modelImageWidth: number;
     modelImageHeight: number;
     scaleFactor: number;
     signal: AbortSignal;
-  }): Promise<{ finished: boolean }> {
-    if (!this.executorModel) throw new Error("Executor model not initialized");
-    const { toolName, toolArgs, modelImageWidth, modelImageHeight, scaleFactor, signal } = opts;
-
-    const toolsByName = this.buildExecutorTools({
+  }): Promise<void> {
+    const { actionType, args, modelImageWidth, modelImageHeight, scaleFactor, signal } = opts;
+    await executeUiTarsActionFromObj({
+      actionType: String(actionType || ""),
+      args: args ?? {},
       modelImageWidth,
       modelImageHeight,
       scaleFactor,
       signal,
-    }) as Record<string, any>;
-
-    const toolImpl = (toolsByName as any)[toolName];
-    if (!toolImpl) {
-      throw new Error(`Unknown tool called by executor model: ${toolName}`);
-    }
-    const result = await toolImpl.invoke(toolArgs ?? {});
-    const finished = !!(result && (result as any).finished);
-    return { finished };
+      sendToOverlay: (channel, payload) => this.sendToOverlay(channel, payload),
+    });
   }
-
-
-
-
-  // Executor tools Builder
-  private buildExecutorTools(opts: {
-    modelImageWidth: number;
-    modelImageHeight: number;
-    scaleFactor: number;
-    signal: AbortSignal;
-  }): Record<string, any> {
-    const { modelImageWidth, modelImageHeight, scaleFactor, signal } = opts;
-    const act = async (action: string) => {
-      const { pendingOverlay } = await executeUiTarsAction({
-        actionResponse: action,
-        modelImageWidth,
-        modelImageHeight,
-        scaleFactor,
-        signal,
-        sendToOverlay: (channel, payload) => this.sendToOverlay(channel, payload),
-      });
-      // NOTE: pending overlay is computed in a dedicated LangGraph node BEFORE execute.
-      // Execute tool should be side-effect only (do NOT compute/update pending overlay here).
-      return { ok: true };
-    };
-
-    const click: any = tool(
-      async ({ x, y }: { x: number; y: number }) =>
-        act(`Action: click(start_box='<|box_start|>(${x}, ${y})<|box_end|>')`),
-      {
-        name: "click",
-        description: "Left click once at (x, y). Coordinates are PIXELS in the current screenshot.",
-        schema: z.object({ x: z.number().int(), y: z.number().int() }) as any,
-      },
-    ) as any;
-
-    const left_double: any = tool(
-      async ({ x, y }: { x: number; y: number }) =>
-        act(`Action: left_double(start_box='<|box_start|>(${x}, ${y})<|box_end|>')`),
-      {
-        name: "left_double",
-        description: "Left double click at (x, y). Coordinates are PIXELS in the current screenshot.",
-        schema: z.object({ x: z.number().int(), y: z.number().int() }) as any,
-      },
-    ) as any;
-
-    const right_single: any = tool(
-      async ({ x, y }: { x: number; y: number }) =>
-        act(`Action: right_single(start_box='<|box_start|>(${x}, ${y})<|box_end|>')`),
-      {
-        name: "right_single",
-        description: "Right click once at (x, y). Coordinates are PIXELS in the current screenshot.",
-        schema: z.object({ x: z.number().int(), y: z.number().int() }) as any,
-      },
-    ) as any;
-
-    const drag: any = tool(
-      async ({
-        start_x,
-        start_y,
-        end_x,
-        end_y,
-      }: {
-        start_x: number;
-        start_y: number;
-        end_x: number;
-        end_y: number;
-      }) =>
-        act(
-          `Action: drag(start_box='<|box_start|>(${start_x}, ${start_y})<|box_end|>', end_box='<|box_start|>(${end_x}, ${end_y})<|box_end|>')`,
-        ),
-      {
-        name: "drag",
-        description: "Drag from (start_x, start_y) to (end_x, end_y). Coordinates are PIXELS in the current screenshot.",
-        schema: z.object({
-          start_x: z.number().int(),
-          start_y: z.number().int(),
-          end_x: z.number().int(),
-          end_y: z.number().int(),
-        }) as any,
-      },
-    ) as any;
-
-    const hotkey: any = tool(
-      async ({ key }: { key: string }) => act(`Action: hotkey(key='${escapeSingleQuotes(key)}')`),
-      {
-        name: "hotkey",
-        description: "Press a keyboard shortcut. Example: key='cmd+f' or key='ctrl+v' or key='enter'.",
-        schema: z.object({ key: z.string() }) as any,
-      },
-    ) as any;
-
-    const type: any = tool(
-      async ({ content }: { content: string }) =>
-        act(`Action: type(content='${escapeSingleQuotes(content)}')`),
-      {
-        name: "type",
-        description: "Type text into the currently focused input.",
-        schema: z.object({ content: z.string() }) as any,
-      },
-    ) as any;
-
-    const scroll: any = tool(
-      async ({
-        x,
-        y,
-        direction,
-        magnitude,
-      }: {
-        x: number;
-        y: number;
-        direction: "down" | "up" | "left" | "right";
-        magnitude?: number;
-      }) =>
-        act(
-          `Action: scroll(start_box='<|box_start|>(${x}, ${y})<|box_end|>', direction='${direction}'${
-            magnitude != null ? `, magnitude=${Math.trunc(magnitude)}` : ""
-          })`,
-        ),
-      {
-        name: "scroll",
-        description:
-          "Scroll at (x, y) towards the given direction. Coordinates are PIXELS in the current screenshot. magnitude controls scroll amount (default is 1). You should make this decision based on the task",
-        schema: z.object({
-          x: z.number().int(),
-          y: z.number().int(),
-          direction: z.enum(["down", "up", "left", "right"]),
-          magnitude: z.number().int().min(1).max(10).optional(),
-        }) as any,
-      },
-    ) as any;
-
-    const wait: any = tool(async () => act("Action: wait()"), {
-      name: "wait",
-      description: "Wait for 5 seconds (then the next loop will take a new screenshot).",
-      schema: z.object({}) as any,
-    }) as any;
-
-    const finished: any = tool(async ({ content }: { content?: string }) => ({ finished: true, content }), {
-      name: "finished",
-      description: "Finish the task. content is optional.",
-      schema: z.object({ content: z.string().optional() }) as any,
-    }) as any;
-
-    return {
-      click,
-      left_double,
-      right_single,
-      drag,
-      hotkey,
-      type,
-      scroll,
-      wait,
-      finished,
-    };
-  }
+  // NOTE: executor action execution no longer uses tool calling.
+  // We use per-action structured schemas + executeUiTarsActionFromObj instead.
 
   // action parsing/execution moved to utils.ts
 }

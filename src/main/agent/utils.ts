@@ -72,8 +72,6 @@ export const mapKey = (key: string): string => {
   return map[key.toLowerCase()] || key.toLowerCase();
 };
 
-export const escapeSingleQuotes = (s: string) =>
-  (s ?? "").replace(/\\/g, "\\\\").replace(/'/g, "\\'");
 
 // Jimp built-in bitmap fonts don't support CJK glyphs; render non-ASCII as escapes so overlay is readable.
 export function truncateForOverlayLabel(input: string, maxLen: number) {
@@ -226,81 +224,7 @@ end tell
   return { stdout, exitCode: Number.isFinite(exitCode) ? exitCode : 1, outputPath, statusPath };
 }
 
-export async function runInVisibleTerminal(opts: {
-  shellCommand: string;
-  signal?: AbortSignal;
-  pollIntervalMs?: number;
-  timeoutMs?: number;
-}): Promise<{ stdout: string; exitCode: number; outputPath: string; statusPath: string }> {
-  const { shellCommand, signal, pollIntervalMs = 250, timeoutMs = 2 * 60_000 } = opts;
-
-  if (signal?.aborted) throw new Error("Aborted");
-  const tempId = `${Date.now()}_${Math.random().toString(16).slice(2)}`;
-  const outputPath = path.join(os.tmpdir(), `piglet_terminal_out_${tempId}.log`);
-  const statusPath = path.join(os.tmpdir(), `piglet_terminal_status_${tempId}.log`);
-
-  // Ensure clean slate
-  try {
-    await fs.unlink(outputPath);
-  } catch {}
-  try {
-    await fs.unlink(statusPath);
-  } catch {}
-
-  // Goal: user can SEE the live output in Terminal.app, while we also CAPTURE it for function return.
-  // Strategy: run command through `tee` (writes to file + prints to terminal).
-  // We need PIPESTATUS[0] to preserve the exit code of the command (not tee), so we ensure the outer shell is bash.
-  const pipeStatus0 = "${PIPESTATUS[0]}";
-  const inner = `bash -lc ${JSON.stringify(String(shellCommand ?? ""))} 2>&1 | tee "${outputPath}"; echo ${pipeStatus0} > "${statusPath}"`;
-  const wrappedCommand = `bash -lc ${JSON.stringify(inner)}`;
-
-  const script = `
-tell application "Terminal"
-  activate
-  do script "${escapeAppleScriptString(wrappedCommand)}"
-end tell
-`;
-
-  // Fire-and-forget Terminal execution (osascript itself returns immediately).
-  try {
-    await execFileAsync("osascript", ["-e", script], { timeout: 15_000 });
-  } catch (e: any) {
-    throw new Error(`无法启动 Terminal.app 或执行 AppleScript: ${e?.message ?? e}`);
-  }
-
-  const start = Date.now();
-  while (true) {
-    if (signal?.aborted) throw new Error("Aborted");
-    if (Date.now() - start > timeoutMs) {
-      throw new Error(`Terminal 命令执行超时（>${timeoutMs}ms）: ${shellCommand}`);
-    }
-
-    // statusPath is written at the end of wrappedCommand
-    if (fsSync.existsSync(statusPath)) break;
-    await sleep(pollIntervalMs, signal);
-  }
-
-  const stdout = await fs.readFile(outputPath, "utf8").catch(() => "");
-  const codeText = await fs.readFile(statusPath, "utf8").catch(() => "1");
-  const exitCode = Number.parseInt(String(codeText).trim(), 10);
-  return { stdout, exitCode: Number.isFinite(exitCode) ? exitCode : 1, outputPath, statusPath };
-}
-
-// Executor tool schema: keep stable & human-readable (don't depend on LangChain internals)
-export function getExecutorToolSchemaText(toolName: string) {
-  const schemas: Record<string, string> = {
-    click: "{ x: int, y: int }",
-    left_double: "{ x: int, y: int }",
-    right_single: "{ x: int, y: int }",
-    drag: "{ start_x: int, start_y: int, end_x: int, end_y: int }",
-    hotkey: "{ key: string }",
-    type: "{ content: string }",
-    scroll: "{ x: int, y: int, direction: 'down' | 'up' | 'left' | 'right', magnitude?: int (default 10) }",
-    wait: "{}",
-    finished: "{ content?: string }",
-  };
-  return schemas[toolName] || "{}";
-}
+// NOTE: runInVisibleTerminal removed (superseded by tty-based terminal session helpers).
 
 export type PendingScreenshotOverlay =
   | {
@@ -325,13 +249,17 @@ export type PendingScreenshotOverlay =
     }
   | null;
 
-export function computePendingOverlayFromToolCall(opts: {
-  toolName: string;
+/**
+ * Compute pending overlay annotation for the NEXT screenshot (Advanced model).
+ * Input is the structured executor action object (actionType + args), in model image coordinates.
+ */
+export function computePendingOverlay(opts: {
+  actionType: string;
   args: Record<string, any>;
   modelImageWidth: number;
   modelImageHeight: number;
 }): PendingScreenshotOverlay {
-  const { toolName, args, modelImageWidth, modelImageHeight } = opts;
+  const { actionType, args, modelImageWidth, modelImageHeight } = opts;
   const screenSize = robot.getScreenSize();
 
   const mapXY = (x: number, y: number) => {
@@ -341,7 +269,7 @@ export function computePendingOverlayFromToolCall(opts: {
   };
 
   try {
-    switch (toolName) {
+    switch (String(actionType || "")) {
       case "click": {
         const x = Number(args?.x);
         const y = Number(args?.y);
@@ -639,80 +567,61 @@ export async function captureScreenB64(opts: {
   };
 }
 
-export type ParsedAction =
-  | {
-      actionType: string;
-      args: Record<string, any>;
-    }
-  | null;
-
-export function parseUiTarsAction(actionStr: string): ParsedAction {
-  // Improved regex to capture action name and arguments (对齐 dualAgent.ts)
-  const match = actionStr.match(/^([a-z_]+)\((.*)\)$/);
-  if (!match) return null;
-
-  const actionType = match[1];
-  const argsStr = match[2];
-  const args: any = {};
-
-  // Extract content='...'
-  const contentMatch = argsStr.match(/content='((?:[^'\\]|\\.)*)'/);
-  if (contentMatch) args.content = contentMatch[1];
-
-  // Extract key='...'
-  const keyMatch = argsStr.match(/key='([^']+)'/);
-  if (keyMatch) args.key = keyMatch[1];
-
-  // Extract start_box='(x,y)'
-  const startBoxMatch = argsStr.match(
-    /start_box=['"]?(?:<\|box_start\|>)?[\(\[](\d+),\s*(\d+)[\)\]](?:<\|box_end\|>)?['"]?/,
-  );
-  if (startBoxMatch) {
-    args.start_box = [parseInt(startBoxMatch[1]), parseInt(startBoxMatch[2])];
-  }
-
-  // Extract end_box='(x,y)'
-  const endBoxMatch = argsStr.match(
-    /end_box=['"]?(?:<\|box_start\|>)?[\(\[](\d+),\s*(\d+)[\)\]](?:<\|box_end\|>)?['"]?/,
-  );
-  if (endBoxMatch) {
-    args.end_box = [parseInt(endBoxMatch[1]), parseInt(endBoxMatch[2])];
-  }
-
-  // Extract direction
-  const dirMatch = argsStr.match(/direction='([^']+)'/);
-  if (dirMatch) args.direction = dirMatch[1];
-
-  // Extract magnitude (optional, executor tool only)
-  const magMatch = argsStr.match(/magnitude=(\d+)/) || argsStr.match(/magnitude='(\d+)'/);
-  if (magMatch) args.magnitude = parseInt(magMatch[1], 10);
-
-  return { actionType, args };
-}
-
-export async function executeUiTarsAction(opts: {
-  actionResponse: string;
+/**
+ * Execute UI-TARS action directly from a structured action object (no "Action: xxx(...)" text parsing).
+ * This matches the executor action schemas in schema.ts.
+ */
+export async function executeUiTarsActionFromObj(opts: {
+  actionType: string;
+  args: Record<string, any>;
   modelImageWidth: number;
   modelImageHeight: number;
-  scaleFactor: number; // kept for API compatibility (may be used by callers)
+  scaleFactor: number; // kept for API compatibility
   signal: AbortSignal;
   sendToOverlay: (channel: string, payload: any) => void;
-}): Promise<{ pendingOverlay: PendingScreenshotOverlay }> {
-  if (opts.signal.aborted) return { pendingOverlay: null };
+}): Promise<{ pendingOverlay: PendingScreenshotOverlay; finished: boolean }> {
+  if (opts.signal.aborted) return { pendingOverlay: null, finished: false };
+  const { actionType } = opts;
+  const a = opts.args ?? {};
 
-  const screenSize = robot.getScreenSize();
-  console.log(`Action Response: ${opts.actionResponse}`);
-
-  const cleanAction = (opts.actionResponse || "").replace(/^Action:\s*/, "").trim();
-  const parsed = parseUiTarsAction(cleanAction);
-
-  if (!parsed) {
-    console.log("Failed to parse action:", cleanAction);
-    return { pendingOverlay: null };
+  // Normalize schema args into legacy args shape used by executeUiTarsAction switch.
+  const legacyArgs: any = {};
+  if (["click", "left_double", "right_single"].includes(actionType)) {
+    if (Number.isFinite(Number(a.x)) && Number.isFinite(Number(a.y))) {
+      legacyArgs.start_box = [Math.trunc(Number(a.x)), Math.trunc(Number(a.y))];
+    }
+  } else if (actionType === "drag") {
+    if (
+      [a.start_x, a.start_y, a.end_x, a.end_y].every((n: any) => Number.isFinite(Number(n)))
+    ) {
+      legacyArgs.start_box = [Math.trunc(Number(a.start_x)), Math.trunc(Number(a.start_y))];
+      legacyArgs.end_box = [Math.trunc(Number(a.end_x)), Math.trunc(Number(a.end_y))];
+    }
+  } else if (actionType === "scroll") {
+    if (Number.isFinite(Number(a.x)) && Number.isFinite(Number(a.y))) {
+      legacyArgs.start_box = [Math.trunc(Number(a.x)), Math.trunc(Number(a.y))];
+    }
+    if (a.direction) legacyArgs.direction = String(a.direction);
+    if (a.magnitude != null) legacyArgs.magnitude = Math.trunc(Number(a.magnitude));
+  } else if (actionType === "hotkey") {
+    legacyArgs.key = String(a.key ?? "");
+  } else if (actionType === "type") {
+    legacyArgs.content = String(a.content ?? "");
+  } else if (actionType === "wait") {
+    // no args
+  } else if (actionType === "finished") {
+    // no-op
+    return { pendingOverlay: null, finished: true };
   }
 
-  const { actionType, args } = parsed;
+  // Reuse existing implementation by calling a minimal Action string and letting it operate on legacyArgs.
+  // We avoid string parsing by temporarily constructing ParsedAction-like structure through executeUiTarsAction's logic.
+  // Implementation detail: we call into the same switch by crafting the same format that parseUiTarsAction would produce.
+  // (This keeps behavior identical without duplicating the entire switch.)
+  const fakeParsed = { actionType, args: legacyArgs };
 
+  // Inline a minimal subset of executeUiTarsAction without parse step (copy of core logic)
+  const screenSize = robot.getScreenSize();
   const mapCoords = (x: number, y: number) => {
     const logicalX = (x / opts.modelImageWidth) * screenSize.width;
     const logicalY = (y / opts.modelImageHeight) * screenSize.height;
@@ -720,35 +629,35 @@ export async function executeUiTarsAction(opts: {
   };
 
   let pendingOverlay: PendingScreenshotOverlay = null;
+  const parsedArgs = fakeParsed.args;
 
   // --- Strictly Following UI-TARS Logic via RobotJS Adaptation ---
-  switch (actionType) {
+  switch (fakeParsed.actionType) {
     case "click":
     case "left_click":
     case "left_single":
-      if (args.start_box) {
-        const { x, y } = mapCoords(args.start_box[0], args.start_box[1]);
+      if (parsedArgs.start_box) {
+        const { x, y } = mapCoords(parsedArgs.start_box[0], parsedArgs.start_box[1]);
         robot.moveMouse(x, y);
         opts.sendToOverlay("draw-highlight", { type: "click", x, y });
         await sleep(100, opts.signal);
-        if (opts.signal.aborted) return { pendingOverlay };
+        if (opts.signal.aborted) return { pendingOverlay, finished: false };
         robot.mouseClick();
-        // annotate next screenshot
         pendingOverlay = { kind: "click", x, y, label: "click" };
       }
       break;
 
     case "left_double":
     case "double_click":
-      if (args.start_box) {
-        const { x, y } = mapCoords(args.start_box[0], args.start_box[1]);
+      if (parsedArgs.start_box) {
+        const { x, y } = mapCoords(parsedArgs.start_box[0], parsedArgs.start_box[1]);
         robot.moveMouse(x, y);
         opts.sendToOverlay("draw-highlight", { type: "double_click", x, y });
         await sleep(100, opts.signal);
-        if (opts.signal.aborted) return { pendingOverlay };
+        if (opts.signal.aborted) return { pendingOverlay, finished: false };
         robot.mouseClick("left");
-        await sleep(10, opts.signal); // within system double-click threshold
-        if (opts.signal.aborted) return { pendingOverlay };
+        await sleep(10, opts.signal);
+        if (opts.signal.aborted) return { pendingOverlay, finished: false };
         robot.mouseClick("left", true);
         pendingOverlay = { kind: "double_click", x, y, label: "left double click" };
       }
@@ -756,34 +665,23 @@ export async function executeUiTarsAction(opts: {
 
     case "right_single":
     case "right_click":
-      if (args.start_box) {
-        const { x, y } = mapCoords(args.start_box[0], args.start_box[1]);
+      if (parsedArgs.start_box) {
+        const { x, y } = mapCoords(parsedArgs.start_box[0], parsedArgs.start_box[1]);
         robot.moveMouse(x, y);
         opts.sendToOverlay("draw-highlight", { type: "right_click", x, y });
         await sleep(100, opts.signal);
-        if (opts.signal.aborted) return { pendingOverlay };
+        if (opts.signal.aborted) return { pendingOverlay, finished: false };
         robot.mouseClick("right");
         pendingOverlay = { kind: "right_click", x, y, label: "right click" };
-      }
-      break;
-
-    case "middle_click":
-      if (args.start_box) {
-        const { x, y } = mapCoords(args.start_box[0], args.start_box[1]);
-        robot.moveMouse(x, y);
-        opts.sendToOverlay("draw-highlight", { type: "middle_click", x, y });
-        robot.mouseClick("middle");
-        pendingOverlay = { kind: "middle_click", x, y, label: "middle click" };
       }
       break;
 
     case "drag":
     case "left_click_drag":
     case "select":
-      if (args.start_box && args.end_box) {
-        const start = mapCoords(args.start_box[0], args.start_box[1]);
-        const end = mapCoords(args.end_box[0], args.end_box[1]);
-
+      if (parsedArgs.start_box && parsedArgs.end_box) {
+        const start = mapCoords(parsedArgs.start_box[0], parsedArgs.start_box[1]);
+        const end = mapCoords(parsedArgs.end_box[0], parsedArgs.end_box[1]);
         opts.sendToOverlay("draw-highlight", {
           type: "drag",
           startX: start.x,
@@ -791,135 +689,84 @@ export async function executeUiTarsAction(opts: {
           endX: end.x,
           endY: end.y,
         });
-
         robot.moveMouse(start.x, start.y);
         await sleep(100, opts.signal);
-        if (opts.signal.aborted) return { pendingOverlay };
+        if (opts.signal.aborted) return { pendingOverlay, finished: false };
         robot.mouseToggle("down");
         try {
           robot.dragMouse(end.x, end.y);
         } finally {
-          // Always release mouse to avoid stuck "mouse down" if task is aborted mid-action
           try {
             robot.mouseToggle("up");
-          } catch {
-            // ignore
-          }
+          } catch {}
         }
-        pendingOverlay = {
-          kind: "drag",
-          startX: start.x,
-          startY: start.y,
-          endX: end.x,
-          endY: end.y,
-          label: "drag",
-        };
-      }
-      break;
-
-    case "mouse_move":
-    case "hover":
-      if (args.start_box) {
-        const { x, y } = mapCoords(args.start_box[0], args.start_box[1]);
-        robot.moveMouse(x, y);
-        opts.sendToOverlay("draw-highlight", { type: "hover", x, y });
-        pendingOverlay = { kind: "hover", x, y, label: "hover" };
+        pendingOverlay = { kind: "drag", startX: start.x, startY: start.y, endX: end.x, endY: end.y, label: "drag" };
       }
       break;
 
     case "type":
-      if (args.content) {
-        console.log(`Typing: ${args.content}`);
-        const content = args.content;
+      if (parsedArgs.content) {
+        const content = parsedArgs.content;
         const stripContent = content.replace(/\\n$/, "").replace(/\n$/, "");
-
         opts.sendToOverlay("draw-highlight", { type: "type", x: 0, y: 0, text: content });
-
-        if (process.platform === "win32") {
-          clipboard.writeText(stripContent);
-          robot.keyTap("v", "control");
-          await sleep(50, opts.signal);
-        } else {
-          clipboard.writeText(stripContent);
-          robot.keyTap("v", "command");
-          await sleep(50, opts.signal);
-        }
-
+        clipboard.writeText(stripContent);
+        robot.keyTap("v", process.platform === "win32" ? "control" : "command");
+        await sleep(50, opts.signal);
         if (content.endsWith("\n") || content.endsWith("\\n")) {
-          if (opts.signal.aborted) return { pendingOverlay };
+          if (opts.signal.aborted) return { pendingOverlay, finished: false };
           robot.keyTap("enter");
         }
-        pendingOverlay = {
-          kind: "type",
-          label: `type: "${truncateForOverlayLabel(stripContent, 32)}"`,
-        };
+        pendingOverlay = { kind: "type", label: `type: "${truncateForOverlayLabel(stripContent, 32)}"` };
       }
       break;
 
     case "hotkey":
     case "press":
-      if (args.key) {
-        const rawKey = String(args.key ?? "").trim().toLowerCase();
-        // 兼容：
-        // - "command+shift+3"（推荐格式）
-        // - "command shift 3"
-        // - "page down"（单键，带空格；mapKey 支持这个 key 名）
+      if (parsedArgs.key) {
+        const rawKey = String(parsedArgs.key ?? "").trim().toLowerCase();
         let keys: string[] = [];
-        if (rawKey.includes("+")) {
-          keys = rawKey.split("+").map((s: string) => s.trim()).filter(Boolean);
-        } else if (mapKey(rawKey) !== rawKey) {
-          keys = [rawKey];
-        } else {
-          keys = rawKey.split(/\s+/).map((s: string) => s.trim()).filter(Boolean);
-        }
+        if (rawKey.includes("+")) keys = rawKey.split("+").map((s: string) => s.trim()).filter(Boolean);
+        else if (mapKey(rawKey) !== rawKey) keys = [rawKey];
+        else keys = rawKey.split(/\s+/).map((s: string) => s.trim()).filter(Boolean);
         const modifiers: string[] = [];
         let mainKey = "";
-        const ordered: string[] = [];
-
         keys.forEach((k: string) => {
           const mapped = mapKey(k);
-          ordered.push(mapped);
           if (["command", "control", "alt", "shift"].includes(mapped)) {
             if (!modifiers.includes(mapped)) modifiers.push(mapped);
           } else {
             mainKey = mapped;
           }
         });
-
         if (mainKey) {
-          console.log(`Main Key: ${mainKey}`);
-          console.log(`Hotkey: ${modifiers.join("+")}`);
-          opts.sendToOverlay("draw-highlight", { type: "hotkey", text: args.key });
+          opts.sendToOverlay("draw-highlight", { type: "hotkey", text: parsedArgs.key });
           robot.keyTap(mainKey, modifiers);
-          pendingOverlay = { kind: "hotkey", label: args.key };
+          pendingOverlay = { kind: "hotkey", label: parsedArgs.key };
         }
       }
       break;
 
     case "scroll":
-      if (args.direction) {
+      if (parsedArgs.direction) {
         let scrollTarget: { x: number; y: number } | null = null;
-        if (args.start_box) {
-          const { x, y } = mapCoords(args.start_box[0], args.start_box[1]);
+        if (parsedArgs.start_box) {
+          const { x, y } = mapCoords(parsedArgs.start_box[0], parsedArgs.start_box[1]);
           robot.moveMouse(x, y);
           scrollTarget = { x, y };
         }
-
-        const rawMag = (args as any).magnitude;
+        const rawMag = parsedArgs.magnitude;
         const magnitude_beforeScroll = Number.isFinite(Number(rawMag)) ? Math.max(1, Math.min(10, Number(rawMag))) : 1;
         const magnitude = magnitude_beforeScroll * 100;
-        opts.sendToOverlay("draw-highlight", { type: "scroll", text: args.direction });
-
-        if (args.direction === "down") robot.scrollMouse(0, -magnitude);
-        if (args.direction === "up") robot.scrollMouse(0, magnitude);
-        if (args.direction === "left") robot.scrollMouse(-magnitude, 0);
-        if (args.direction === "right") robot.scrollMouse(magnitude, 0);
-
+        opts.sendToOverlay("draw-highlight", { type: "scroll", text: parsedArgs.direction });
+        if (parsedArgs.direction === "down") robot.scrollMouse(0, -magnitude);
+        if (parsedArgs.direction === "up") robot.scrollMouse(0, magnitude);
+        if (parsedArgs.direction === "left") robot.scrollMouse(-magnitude, 0);
+        if (parsedArgs.direction === "right") robot.scrollMouse(magnitude, 0);
         pendingOverlay = {
           kind: "scroll",
           x: scrollTarget?.x,
           y: scrollTarget?.y,
-          label: `${args.direction} (x${magnitude_beforeScroll})`,
+          label: `${parsedArgs.direction} (x${magnitude_beforeScroll})`,
         };
       }
       break;
@@ -930,14 +777,11 @@ export async function executeUiTarsAction(opts: {
       pendingOverlay = { kind: "wait", label: "wait" };
       break;
 
-    case "finished":
-      break;
-
     default:
-      console.log("Unhandled action:", actionType);
+      console.log("Unhandled action:", fakeParsed.actionType);
   }
 
-  return { pendingOverlay };
+  return { pendingOverlay, finished: false };
 }
 
 export function selfTestMouseMovement(signal: AbortSignal) {
