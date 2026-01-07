@@ -412,7 +412,9 @@ export function computePendingOverlay(opts: {
         return { kind: "type", label: `type: "${truncateForOverlayLabel(stripContent, 32)}"` };
       }
       case "wait": {
-        return { kind: "wait", label: "wait" };
+        const raw = args?.timeSec;
+        const t = Number.isFinite(Number(raw)) ? Math.max(0, Number(raw)) : 5;
+        return { kind: "wait", label: `wait ${t}s` };
       }
       case "scroll": {
         const x = Number(args?.x);
@@ -708,7 +710,8 @@ export async function executeUiTarsActionFromObj(opts: {
   } else if (actionType === "type") {
     legacyArgs.content = String(a.content ?? "");
   } else if (actionType === "wait") {
-    // no args
+    legacyArgs.timeSec =
+      a?.timeSec == null ? null : (Number.isFinite(Number(a.timeSec)) ? Number(a.timeSec) : null);
   } else if (actionType === "finished") {
     // no-op
     return { pendingOverlay: null, finished: true };
@@ -873,8 +876,12 @@ export async function executeUiTarsActionFromObj(opts: {
 
     case "wait":
       opts.sendToOverlay("draw-highlight", { type: "wait" });
-      await sleep(5000, opts.signal);
-      pendingOverlay = { kind: "wait", label: "wait" };
+      {
+        const raw = (parsedArgs as any).timeSec;
+        const t = raw == null ? 5 : (Number.isFinite(Number(raw)) ? Math.max(0, Number(raw)) : 5);
+        await sleep(Math.round(t * 1000), opts.signal);
+        pendingOverlay = { kind: "wait", label: `wait ${t}s` };
+      }
       break;
 
     default:

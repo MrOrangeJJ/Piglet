@@ -67,6 +67,9 @@ const PigletState = Ann.Root({
   plannedToolDisplayText: Ann({ default: () => undefined }),
 
   terminalActionResultText: Ann({ default: () => undefined }),
+
+  // loop timing: set by timer_node; used to compute last loop duration before each call_advanced
+  loopStartMs: Ann({ default: () => undefined }),
 });
 
 type PigletStateType = any;
@@ -308,7 +311,7 @@ export class DualAgentService {
     combined.push(...tail);
 
     // After processing, keep only reverse index 0..10 (last 11 messages)
-    // if (combined.length > 11) combined = combined.slice(-11);
+    if (combined.length > 101) combined = combined.slice(-101);
 
     return systemMsg ? [systemMsg, ...combined] : combined;
   }
@@ -498,6 +501,19 @@ export class DualAgentService {
         });
 
         return { advancedHistory: history };
+      })
+      .addNode("timer_node", async (state: PigletStateType) => {
+        if (signal.aborted) throw new Error("Aborted");
+        const now = Date.now();
+        const prev = Number(state.loopStartMs);
+        const hasPrev = Number.isFinite(prev) && prev > 0;
+        if (hasPrev) {
+          const elapsedMs = Math.max(0, now - prev);
+          // UI divider to mark the previous loop duration
+          this.sendToMain("agent-timer", { elapsedMs });
+        }
+        // First tick: only set baseline, do NOT send.
+        return { loopStartMs: now };
       })
       .addNode("call_advanced", async (state: PigletStateType) => {
         if (signal.aborted) throw new Error("Aborted");
@@ -755,8 +771,9 @@ export class DualAgentService {
         },
         ["manage_terminal_use_history", "manage_computer_use_history"],
       )
-      .addEdge("manage_computer_use_history", "call_advanced")
-      .addEdge("manage_terminal_use_history", "call_advanced")
+      .addEdge("manage_computer_use_history", "timer_node")
+      .addEdge("manage_terminal_use_history", "timer_node")
+      .addEdge("timer_node", "call_advanced")
       .addConditionalEdges(
         "call_advanced",
         (state: PigletStateType) => {
@@ -869,7 +886,7 @@ export class DualAgentService {
   private async callAdvancedStructured(history: BaseMessage[]): Promise<ThoughtResponse> {
     if (!this.advancedModel) throw new Error("Advanced model not initialized");
     const base = this.advancedModel as any;
-    const llm = base.withStructuredOutput(ThoughtResponseSchema, { method: "functionCalling" });
+    const llm = base.withStructuredOutput(ThoughtResponseSchema, { method: "jsonSchema" });
     // const llm = base.withStructuredOutput(ThoughtResponseSchema, { method: "jsonMode" });
 
 
@@ -909,7 +926,7 @@ export class DualAgentService {
     });
 
     const base = this.textActionModel as any;
-    const llm = base.withStructuredOutput(schema, { method: "functionCalling" });
+    const llm = base.withStructuredOutput(schema, { method: "jsonSchema" });
     const res = await llm.invoke([new SystemMessage(systemPrompt)]);
     const parsed = schema.safeParse(res);
     if (!parsed.success) {

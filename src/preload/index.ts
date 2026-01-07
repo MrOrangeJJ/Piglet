@@ -23,6 +23,7 @@ contextBridge.exposeInMainWorld('electron', {
       let validChannels = [
         'agent-thought',
         'agent-action-plan',
+        'agent-timer',
         'agent-tool',
         'agent-response',
         'agent-image',

@@ -63,7 +63,15 @@ export const ScrollSchema = z.object({
     .nullable()
     .describe("Scroll amount multiplier. 1=smallest, 10=largest."),
 });
-export const WaitSchema = z.object({}).describe("Wait action (no args).");
+export const WaitSchema = z
+  .object({
+    timeSec: z
+      .number()
+      .min(1)
+      .nullable()
+      .describe("Wait duration in seconds. If null, default to 5 seconds."),
+  })
+  .describe("Wait action.");
 export const FinishedSchema = z.object({
   content: z.string().optional().describe("Optional final summary to user."),
 });

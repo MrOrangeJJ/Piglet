@@ -65,6 +65,16 @@ const App = () => {
             }]);
     });
 
+    ipcRenderer.on('agent-timer', (_, payload: { elapsedMs: number }) => {
+      const ms = Number(payload?.elapsedMs);
+      if (!Number.isFinite(ms) || ms < 0) return;
+      setLogs(prev => [...prev, {
+        text: String(ms),
+        timestamp: Date.now(),
+        type: 'timer'
+      } as any]);
+    });
+
     // Dedicated image stream for Context View (no longer piggy-backed on thought/action logs)
     ipcRenderer.on('agent-image', (_, payload: { image: string }) => {
             pushTaskImage(payload.image);
@@ -93,6 +103,7 @@ const App = () => {
     return () => {
         ipcRenderer.removeAllListeners('agent-thought');
         ipcRenderer.removeAllListeners('agent-action-plan');
+        ipcRenderer.removeAllListeners('agent-timer');
         ipcRenderer.removeAllListeners('agent-tool');
         ipcRenderer.removeAllListeners('agent-response');
         ipcRenderer.removeAllListeners('agent-image');

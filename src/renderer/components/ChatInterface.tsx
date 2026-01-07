@@ -5,7 +5,7 @@ import { cn } from '../lib/utils';
 export interface LogItem {
     text: string;
     timestamp: number;
-    type: 'thought' | 'action' | 'tool' | 'response' | 'system';
+    type: 'thought' | 'action' | 'tool' | 'response' | 'system' | 'timer';
 }
 
 interface ChatInterfaceProps {
@@ -55,6 +55,22 @@ export const ChatInterface = ({
                 )}
                 
                 {logs.map((log, i) => {
+                    if (log.type === 'timer') {
+                        const ms = Number(log.text);
+                        const seconds = Number.isFinite(ms) ? (ms / 1000) : NaN;
+                        const label = Number.isFinite(seconds) ? `Previous Round Took ${seconds.toFixed(2)}s` : 'Previous';
+                        return (
+                            <div key={i} className="max-w-3xl">
+                                <div className="flex items-center gap-3 py-1">
+                                    <div className="h-px flex-1 bg-border/60" />
+                                    <div className="px-2.5 py-0.5 rounded-full border border-border bg-background text-[11px] text-muted-foreground tabular-nums">
+                                        {label}
+                                    </div>
+                                    <div className="h-px flex-1 bg-border/60" />
+                                </div>
+                            </div>
+                        );
+                    }
                     const isCollapsible = (log.type === 'tool' || log.type === 'action');
                     const expanded = !!expandedTools[i];
                     const headerLabel =
