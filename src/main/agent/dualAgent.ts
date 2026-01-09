@@ -30,6 +30,7 @@ import {
   sleep,
   waitForScreenStability,
   type PendingScreenshotOverlay,
+  timedNode,
 } from './utils';
 import type { AppConfig } from '../store';
 
@@ -458,7 +459,7 @@ export class DualAgentService {
 
     // NOTE: LangGraph 的 TS 类型在复杂项目里仍可能很重；这里保持节点签名宽松（state: any）
     const graph = new StateGraph(PigletState)
-      .addNode("capture", async (state: PigletStateType) => {
+      .addNode("capture", timedNode("capture", async (state: PigletStateType) => {
         if (signal.aborted) throw new Error("Aborted");
         const { base64WithOverlay, base64Raw, width, height, scaleFactor, pendingOverlayAfter } =
           await captureScreenB64({ pendingOverlay: null });
@@ -470,8 +471,8 @@ export class DualAgentService {
           modelH: height,
           scaleFactor,
         };
-      })
-      .addNode("pre_capture", async (state: PigletStateType) => {
+      }))
+      .addNode("pre_capture", timedNode("pre_capture", async (state: PigletStateType) => {
         if (signal.aborted) throw new Error("Aborted");
         const { base64WithOverlay, base64Raw, width, height, scaleFactor, pendingOverlayAfter } =
           await captureScreenB64({ pendingOverlay: this.pendingScreenshotOverlay });
@@ -483,8 +484,8 @@ export class DualAgentService {
           modelH: height,
           scaleFactor,
         };
-      })
-      .addNode("manage_computer_use_history", async (state: PigletStateType) => {
+      }))
+      .addNode("manage_computer_use_history", timedNode("manage_computer_use_history", async (state: PigletStateType) => {
         if (signal.aborted) throw new Error("Aborted");
         const step = state.step || 0;
         const queryForRules = step <= 0 ? state.userQuery : (state.thoughtResponse || "");
@@ -501,8 +502,8 @@ export class DualAgentService {
         });
 
         return { advancedHistory: history };
-      })
-      .addNode("timer_node", async (state: PigletStateType) => {
+      }))
+      .addNode("timer_node", timedNode("timer_node", async (state: PigletStateType) => {
         if (signal.aborted) throw new Error("Aborted");
         const now = Date.now();
         const prev = Number(state.loopStartMs);
@@ -514,8 +515,8 @@ export class DualAgentService {
         }
         // First tick: only set baseline, do NOT send.
         return { loopStartMs: now };
-      })
-      .addNode("call_advanced", async (state: PigletStateType) => {
+      }))
+      .addNode("call_advanced", timedNode("call_advanced", async (state: PigletStateType) => {
         if (signal.aborted) throw new Error("Aborted");
         const history = (state.advancedHistory || []) as any as BaseMessage[];
         const trimmedHistory = this.trimAdvancedHistoryForInvoke(history);
@@ -546,8 +547,8 @@ export class DualAgentService {
           advancedHistory: updatedHistory,
           step: (state.step || 0) + 1,
         };
-      })
-      .addNode("call_terminal_action", async (state: PigletStateType) => {
+      }))
+      .addNode("call_terminal_action", timedNode("call_terminal_action", async (state: PigletStateType) => {
         if (signal.aborted) throw new Error("Aborted");
         if (!this.advancedModel) throw new Error("Advanced model not initialized");
 
@@ -637,8 +638,8 @@ export class DualAgentService {
           (toolOutputs.length ? `Terminal 详细输出：\n\n${toolOutputs.join("\n\n---\n\n")}` : "");
 
         return { terminalActionResultText: merged || (finalSummary || "Terminal 执行结束（无输出）。") };
-      })
-      .addNode("manage_terminal_use_history", async (state: PigletStateType) => {
+      }))
+      .addNode("manage_terminal_use_history", timedNode("manage_terminal_use_history", async (state: PigletStateType) => {
         if (signal.aborted) throw new Error("Aborted");
         const terminalResultText = (state.terminalActionResultText || "").toString();
         const base64Raw = String(state.rawScreenshotB64 || "");
@@ -658,8 +659,8 @@ export class DualAgentService {
 
         const nextHistory = [...(state.advancedHistory || []), msg];
         return { advancedHistory: nextHistory };
-      })
-      .addNode("call_coord_action", async (state: PigletStateType) => {
+      }))
+      .addNode("call_coord_action", timedNode("call_coord_action", async (state: PigletStateType) => {
         if (signal.aborted) throw new Error("Aborted");
         if (!this.coordActionModel) throw new Error("Coord action model not initialized");
         const actionType = String(state.actionType || "");
@@ -698,8 +699,8 @@ export class DualAgentService {
           plannedToolArgs: args,
           plannedToolDisplayText: displayText,
         };
-      })
-      .addNode("call_text_action", async (state: PigletStateType) => {
+      }))
+      .addNode("call_text_action", timedNode("call_text_action", async (state: PigletStateType) => {
         if (signal.aborted) throw new Error("Aborted");
         const actionType = String(state.actionType || "");
         const planned = await this.prepareTextActionArgs({
@@ -712,8 +713,8 @@ export class DualAgentService {
           plannedToolArgs: planned.args,
           plannedToolDisplayText: planned.displayText,
         };
-      })
-      .addNode("plan_overlay", async (state: PigletStateType) => {
+      }))
+      .addNode("plan_overlay", timedNode("plan_overlay", async (state: PigletStateType) => {
         if (signal.aborted) throw new Error("Aborted");
         const actionType = String(state.plannedToolName || state.actionType || "");
         const args = (state.plannedToolArgs ?? {}) as any;
@@ -725,8 +726,8 @@ export class DualAgentService {
         });
         if (pending) this.pendingScreenshotOverlay = pending;
         return {};
-      })
-      .addNode("execute", async (state: PigletStateType) => {
+      }))
+      .addNode("execute", timedNode("execute", async (state: PigletStateType) => {
         if (signal.aborted) throw new Error("Aborted");
         await this.executePlannedAction({
           actionType: state.plannedToolName,
@@ -742,9 +743,9 @@ export class DualAgentService {
         this.sendToMain("agent-action-plan", { text: state.plannedToolDisplayText || "" });
         this.sendToMain("agent-image", { image: imageSrc });
         return {};
-      })
+      }))
 
-      .addNode("sleep", async () => {
+      .addNode("sleep", timedNode("sleep", async () => {
       // After executing an action, continuously capture screenshots and wait until the screen is stable.
       // Mirror `screendiff.py` logic: MSE -> causal EMA(alpha=0.3) -> log1p; stable when log <= 0.2 for >=0.5s.
       // Give up after 5s and proceed anyway.
@@ -756,10 +757,9 @@ export class DualAgentService {
         stableDurationMs: 200,
         maxWaitMs: 2000,
       });
-      console.log(waitResult);
 
         return {};
-      })
+      }))
       .addEdge(START, "capture")
       .addConditionalEdges(
         "capture",

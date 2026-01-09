@@ -614,13 +614,17 @@ export async function captureScreenB64(opts: {
   scaleFactor: number;
   pendingOverlayAfter: PendingScreenshotOverlay;
 }> {
+
   const imgBuffer = await screenshot({ format: "png" });
+ 
   const screenSize = robot.getScreenSize();
 
   // Base screenshot (no overlay)
   const rawImage = await jimp.read(imgBuffer);
+
   // Clone for Advanced (with overlay injected)
   const overlayImage = rawImage.clone();
+
 
   const scaleFactor = rawImage.bitmap.width / screenSize.width;
   const MAX_PIXELS = opts.maxPixels ?? 2116800;
@@ -656,8 +660,10 @@ export async function captureScreenB64(opts: {
     overlayImage.resize(newWidth, newHeight);
   }
 
+
   const base64Raw = (await rawImage.getBufferAsync(jimp.MIME_PNG)).toString("base64");
   const base64WithOverlay = (await overlayImage.getBufferAsync(jimp.MIME_PNG)).toString("base64");
+
 
   return {
     base64Raw,
@@ -906,4 +912,15 @@ export function selfTestMouseMovement(signal: AbortSignal) {
   console.log("Mouse test complete.");
 }
 
+
+export const timedNode =
+(name: string, fn: (state: any) => Promise<any>) =>
+async (state: any) => {
+  const t0 = Date.now();
+  try {
+    return await fn(state);
+  } finally {
+    console.log(`[node:${name}] ${Date.now() - t0}ms`);
+  }
+};
 
