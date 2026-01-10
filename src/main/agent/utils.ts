@@ -266,23 +266,38 @@ export async function runCommandInTerminalTTY(opts: {
   if (signal?.aborted) throw new Error("Aborted");
   if (!tty || !tty.startsWith("/dev/")) throw new Error(`Invalid tty: ${tty}`);
 
-  const tempId = `${Date.now()}_${Math.random().toString(16).slice(2)}`;
-  const outputPath = path.join(os.tmpdir(), `piglet_terminal_out_${tempId}.log`);
-  const statusPath = path.join(os.tmpdir(), `piglet_terminal_status_${tempId}.log`);
+  // Goal: make the visible Terminal show the REAL command line (not a long bash/tee wrapper),
+  // while we still capture output + exit code.
+  //
+  // Strategy: write unique START/END markers into the same terminal tab, and read Terminal's `history`
+  // (AppleScript property) to capture the scrollback. This keeps what the user sees readable.
+  const id = `${Date.now()}_${Math.random().toString(16).slice(2)}`;
+  const startMarker = `__PIGLET_START_${id}__`;
+  const endMarkerPrefix = `__PIGLET_END_${id}__:`; // will append $?
 
-  try {
-    await fs.unlink(outputPath);
-  } catch {}
-  try {
-    await fs.unlink(statusPath);
-  } catch {}
+  const outputPath = ""; // legacy field (no longer used)
+  const statusPath = ""; // legacy field (no longer used)
 
-  // Show output in Terminal + capture via tee; preserve exit code of the command (not tee) using PIPESTATUS[0] in bash.
-  const pipeStatus0 = "${PIPESTATUS[0]}";
-  const inner = `bash -lc ${JSON.stringify(String(shellCommand ?? ""))} 2>&1 | tee "${outputPath}"; echo ${pipeStatus0} > "${statusPath}"`;
-  const wrappedCommand = `bash -lc ${JSON.stringify(inner)}`;
+  const findTabScript = `
+tell application "Terminal"
+  set targetTab to missing value
+  repeat with w in windows
+    repeat with t in tabs of w
+      try
+        if tty of t is "${escapeAppleScriptString(tty)}" then
+          set targetTab to t
+          exit repeat
+        end if
+      end try
+    end repeat
+    if targetTab is not missing value then exit repeat
+  end repeat
+  if targetTab is missing value then error "No Terminal tab found for tty: ${escapeAppleScriptString(tty)}"
+end tell
+`;
 
-  const script = `
+  const doLine = async (line: string) => {
+    const script = `
 tell application "Terminal"
   set targetTab to missing value
   repeat with w in windows
@@ -298,12 +313,102 @@ tell application "Terminal"
   end repeat
   if targetTab is missing value then error "No Terminal tab found for tty: ${escapeAppleScriptString(tty)}"
   activate
-  do script "${escapeAppleScriptString(wrappedCommand)}" in targetTab
+  do script "${escapeAppleScriptString(line)}" in targetTab
 end tell
 `;
+    await execFileAsync("osascript", ["-e", script], { timeout: 20_000 });
+  };
+
+  const isBusy = async (): Promise<boolean> => {
+    const script = `
+tell application "Terminal"
+  set targetTab to missing value
+  repeat with w in windows
+    repeat with t in tabs of w
+      try
+        if tty of t is "${escapeAppleScriptString(tty)}" then
+          set targetTab to t
+          exit repeat
+        end if
+      end try
+    end repeat
+    if targetTab is not missing value then exit repeat
+  end repeat
+  if targetTab is missing value then error "No Terminal tab found for tty: ${escapeAppleScriptString(tty)}"
+  return busy of targetTab
+end tell
+`;
+    const { stdout } = await execFileAsync("osascript", ["-e", script], { timeout: 20_000 });
+    return String(stdout ?? "").trim().toLowerCase() === "true";
+  };
+
+  const waitBusyThenNotBusy = async (maxMs: number) => {
+    const start = Date.now();
+    // Wait until it becomes busy (avoid the brief moment right after do script)
+    let becameBusy = false;
+    while (Date.now() - start < Math.min(2000, maxMs)) {
+      if (signal?.aborted) throw new Error("Aborted");
+      try {
+        if (await isBusy()) {
+          becameBusy = true;
+          break;
+        }
+      } catch {
+        // ignore
+      }
+      await sleep(50, signal);
+    }
+    // Then wait until not busy (command completed)
+    while (true) {
+      if (signal?.aborted) throw new Error("Aborted");
+      if (Date.now() - start > maxMs) return;
+      try {
+        const b = await isBusy();
+        if (!b && becameBusy) return;
+        // If it never became busy (very fast command), allow exit once it's not busy.
+        if (!b && !becameBusy) return;
+      } catch {
+        // ignore
+      }
+      await sleep(50, signal);
+    }
+  };
+
+  const getHistory = async () => {
+    const script = `
+tell application "Terminal"
+  set targetTab to missing value
+  repeat with w in windows
+    repeat with t in tabs of w
+      try
+        if tty of t is "${escapeAppleScriptString(tty)}" then
+          set targetTab to t
+          exit repeat
+        end if
+      end try
+    end repeat
+    if targetTab is not missing value then exit repeat
+  end repeat
+  if targetTab is missing value then error "No Terminal tab found for tty: ${escapeAppleScriptString(tty)}"
+  return history of targetTab as text
+end tell
+`;
+    const { stdout } = await execFileAsync("osascript", ["-e", script], { timeout: 20_000 });
+    return String(stdout ?? "");
+  };
 
   try {
-    await execFileAsync("osascript", ["-e", script], { timeout: 20_000 });
+    // Ensure target tab exists (will throw if not).
+    await execFileAsync("osascript", ["-e", findTabScript], { timeout: 20_000 });
+    // 1) Start marker (short, visible)
+    await doLine(`echo "${startMarker}"`);
+    await waitBusyThenNotBusy(10_000);
+    // 2) Main command (what user should clearly see)
+    await doLine(String(shellCommand ?? ""));
+    await waitBusyThenNotBusy(timeoutMs);
+    // 3) End marker printed AFTER main command completes (prevents "typed while busy" artifacts)
+    await doLine(`echo "${endMarkerPrefix}$?"`);
+    await waitBusyThenNotBusy(10_000);
   } catch (e: any) {
     throw new Error(String(e?.message ?? e));
   }
@@ -314,14 +419,36 @@ end tell
     if (Date.now() - start > timeoutMs) {
       throw new Error(`Terminal 命令执行超时（>${timeoutMs}ms）: ${shellCommand}`);
     }
-    if (fsSync.existsSync(statusPath)) break;
+    const hist = await getHistory();
+    // Wait for a real end marker line with exit code
+    if (hist.includes(endMarkerPrefix) && /__PIGLET_END_.*__:\d+/.test(hist)) break;
     await sleep(pollIntervalMs, signal);
   }
 
-  const stdout = await fs.readFile(outputPath, "utf8").catch(() => "");
-  const codeText = await fs.readFile(statusPath, "utf8").catch(() => "1");
-  const exitCode = Number.parseInt(String(codeText).trim(), 10);
-  return { stdout, exitCode: Number.isFinite(exitCode) ? exitCode : 1, outputPath, statusPath };
+  const hist = await getHistory();
+  const startIdx = hist.lastIndexOf(startMarker);
+  const endIdx = hist.indexOf(endMarkerPrefix, startIdx >= 0 ? startIdx : 0);
+  let captured = "";
+  if (startIdx >= 0 && endIdx > startIdx) {
+    captured = hist.slice(startIdx + startMarker.length, endIdx);
+  }
+
+  const m = hist
+    .slice(endIdx, endIdx + 400)
+    .match(new RegExp(`${endMarkerPrefix.replace(/[.*+?^${}()|[\\]\\\\]/g, "\\\\$&")}(\\d+)`));
+  const exitCode = m ? Number.parseInt(m[1], 10) : 1;
+
+  return {
+    // Best-effort cleanup: remove the marker lines themselves to reduce noise for the agent.
+    stdout: (captured || "")
+      .split(/\r?\n/)
+      .filter((line) => !line.includes(startMarker) && !line.includes(endMarkerPrefix))
+      .join("\n")
+      .trim(),
+    exitCode: Number.isFinite(exitCode) ? exitCode : 1,
+    outputPath,
+    statusPath,
+  };
 }
 
 // NOTE: runInVisibleTerminal removed (superseded by tty-based terminal session helpers).

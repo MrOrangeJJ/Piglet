@@ -102,6 +102,10 @@ export class DualAgentService {
   // Overlay annotation to be drawn into NEXT screenshot sent to LLM
   private pendingScreenshotOverlay: PendingScreenshotOverlay = null;
 
+  // Terminal session tty for the CURRENT task (lifetime follows a task).
+  // A new Terminal window/tab is created only when this is null or becomes invalid.
+  private terminalTTYForTask: string | null = null;
+
   // Main window UI state before a task starts (so we can restore after task ends)
   private mainWindowStateBeforeTask: null | {
     wasMinimized: boolean;
@@ -328,6 +332,8 @@ export class DualAgentService {
 
     this.currentConfig = config;
     this.advancedHistory = [];
+    // Each task gets its own Terminal window/tab session; reset at task start.
+    this.terminalTTYForTask = null;
 
     // (coord actions now return structured args; no need to track repeated raw "Action:" lines)
     
@@ -449,6 +455,8 @@ export class DualAgentService {
     this.sendToMain('task-finished'); // Update UI immediately
     // Restore Piglet main window if we minimized it
     this.restoreMainWindowAfterTask();
+    // Task ended: drop terminal session handle (do not reuse across tasks)
+    this.terminalTTYForTask = null;
   }
 
   private async runLoop(instruction: string, signal: AbortSignal) {
@@ -552,9 +560,12 @@ export class DualAgentService {
         if (signal.aborted) throw new Error("Aborted");
         if (!this.advancedModel) throw new Error("Advanced model not initialized");
 
-        // Per requirement: entering call_terminal_action creates a NEW Terminal window/tab once,
-        // and all tool calls within this node reuse the SAME tab via tty.
-        let tty = await openTerminalWindowAndGetTTY({ signal, timeoutMs: 20_000 });
+        // Per requirement: within a task we reuse the same Terminal window/tab (tty).
+        // Create a new one only if we don't have one for this task yet (or it becomes invalid).
+        if (!this.terminalTTYForTask) {
+          this.terminalTTYForTask = await openTerminalWindowAndGetTTY({ signal, timeoutMs: 20_000 });
+        }
+        let tty = this.terminalTTYForTask;
 
         const terminal_run: any = tool(
           async ({ command }: { command: string }) => {
@@ -579,6 +590,7 @@ export class DualAgentService {
               const msg = String(e?.message ?? e);
               if (msg.includes("No Terminal tab found for tty")) {
                 tty = await openTerminalWindowAndGetTTY({ signal, timeoutMs: 20_000 });
+                this.terminalTTYForTask = tty;
                 this.sendToMain("agent-tool", { text: `[Terminal] session tty recreated: ${tty}` });
                 const r = await runOnce();
                 stdout = r.stdout;
